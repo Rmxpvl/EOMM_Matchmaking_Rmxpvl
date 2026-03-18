@@ -1,0 +1,25 @@
+# Standard C/C++ Ignored Files
+
+# Object files
+*.o
+
+# Archive files
+*.a
+
+# Shared libraries
+*.so
+
+# Build output directory
+build/
+
+# Distribution output directory
+dist/
+
+# macOS system files
+.DS_Store
+
+# Visual Studio Code
+.vscode/
+
+# IntelliJ IDEA
+.idea/
