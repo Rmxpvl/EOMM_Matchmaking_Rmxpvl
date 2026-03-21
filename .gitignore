@@ -15,6 +15,10 @@ build/
 # Distribution output directory
 dist/
 
+# EOMM system build artifacts
+bin/
+obj/
+
 # macOS system files
 .DS_Store
 
