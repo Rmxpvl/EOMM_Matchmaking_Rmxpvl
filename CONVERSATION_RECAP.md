@@ -1,27 +1,64 @@
-# EOMM Implementation Discussion Recap
+# EOMM Conversation Recap
 
-**Date**: 2026-03-21  
-**Contributors**: Rmxpvl  
+## Key Decisions Made:
 
-## Summary of Discussions
+1. **Reset Modes**:
+   - **7 Parties** reset mode vs **14 Parties** reset mode discussed. 7 Parties favored for scalability and ease in matchmaking.
 
-Over the course of our discussions regarding the implementation of the EOMM (Enhanced Online Matchmaking) system, we reached several key decisions and outlined our system design and proof objectives. Below is a comprehensive summary:
+2. **Hidden MMR State Categorization**:
+   - Categorized into 3 states: **NEGATIVE**, **NEUTRAL**, and **POSITIVE**. This helps in better matchmaking decisions based on historical performance.
 
-### 1. Decisions Made
-- **Algorithm Selection**: We decided to utilize a hybrid matchmaking algorithm combining both skill-based and latency-based systems to ensure fair gameplay.
-- **Data Management**: We will implement a centralized database structure to store player profiles and matchmaking stats, ensuring that the data is accessible in real-time.
-- **User Interface**: A clean and intuitive UI design will be prioritized to enhance user experience during matchmaking.
+3. **Champion Pool System**:
+   - Introduced a flexible champion pool system that allows players to adapt based on matchmaking conditions and their historical performance.
 
-### 2. System Design
-- **Architecture**: The system will be built using microservices architecture, allowing us to independently scale different components such as matchmaking, user profiles, and lobby management.
-- **Technology Stack**:
-  - Backend: Node.js with Express
-  - Database: MongoDB
-  - Frontend: React.js
+4. **Team Composition Bias**:
+   - Implemented a **30% randomness** factor to encourage diversity in team compositions, aiming for more engaging matches.
 
-### 3. Proof Objectives
-- **Performance Testing**: We aim to conduct thorough performance testing to ensure the system can handle up to 1000 concurrent users without degrading the experience.
-- **User Acceptance Testing**: Engaging a small group of users for acceptance testing before full rollout to gather feedback and make necessary adjustments.
+5. **LoL Standard LP**:
+   - Adopted a similar LP system to League of Legends to standardize player rank and match outcomes, enhancing familiarity among players.
 
-### Conclusion
-This document is a living record of the decisions and designs agreed upon during our discussions. Further updates will be made as development progresses.
+6. **Real-World Smurf Data**:
+   - Analyzed data from **AssBlaster78**, showing **12 losses** with a **good KDA**, reinforcing the need for accurate skill tier assessments.
+
+---
+
+## Expected Outcomes:
+- **Bob**: 58% winrate expected based on past performance metrics.
+- **Alice**: 42% winrate expected, adjustments recommended based on matchmaking feedback.
+
+---
+
+## Proof Narrative:
+- Analyzed data shows that transparent matchmaking leads to clearer expectations and satisfaction among players.
+
+---
+
+## Technical Implementation Details:
+- Constants used in calculation:
+   - `RANDOMNESS_FACTOR = 0.3`
+   - `WINRATE_BOB = 0.58`
+   - `WINRATE_ALICE = 0.42`
+
+```python
+# Example Code Snippet
+class Matchmaking:
+    def __init__(self):
+        self.randomness_factor = 0.3
+
+    def calculate_win_probability(self, player):
+        # Calculation logic here
+        return win_probability
+```
+
+---
+
+## Next Steps Roadmap:
+1.   Refine matchmaking algorithm with feedback from initial testing.
+2.   Implement champion pool system with variable adjustments.
+3.   Gather further data on player behavior under new reset modes.
+4.   Develop documentation for players to understand the changes.
+5.   Schedule follow-up discussions to evaluate impact and adjust strategies as needed.
+
+---
+
+Date Updated: 2026-03-21 03:00:09 UTC
