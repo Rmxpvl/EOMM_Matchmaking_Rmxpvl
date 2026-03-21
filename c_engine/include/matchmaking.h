@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "lol_tiers.h"
+
 typedef struct {
     int player_id;
     float elo_rating;
@@ -11,6 +13,12 @@ typedef struct {
     int wins;
     int losses;
     float playtime_hours;
+    /* LoL rank system */
+    TierEnum tier;
+    int division;   /* 0=I, 1=II, 2=III, 3=IV */
+    /* Role preferences (0-indexed: ROLE_TOP..ROLE_SUPPORT from lol_tiers.h) */
+    int primary_role;
+    int secondary_role;
 } Player;
 
 typedef struct {

@@ -24,6 +24,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "../include/lol_champions.h"
+#include "../include/lol_tiers.h"
+
 #ifndef N_PLAYERS
 #define N_PLAYERS 300
 #endif
@@ -36,7 +39,7 @@
 
 /* Pools */
 #define ROLE_POOL 5
-#define CHAMP_POOL 20
+#define CHAMP_POOL LOL_CHAMP_COUNT   /* 170 real LoL champions */
 
 /* Placement */
 #define PLACEMENT_GAMES 10
@@ -61,6 +64,13 @@
 
 /* Clamp */
 #define HIDDEN_FACTOR_MIN 0.50f
+
+/* Troll pick / tilt-based champion selection */
+#define BASE_TROLL_PROBABILITY  5.0f   /* base 5% chance to troll-pick */
+#define TROLL_FACTOR_PER_LOSS   2.0f   /* +2% per loss streak increment */
+#define TROLL_PROBABILITY_CAP  60.0f   /* maximum 60% troll probability  */
+#define PENALTY_TROLL_PICK      0.20f  /* -20% hidden factor for troll pick */
+#define TROLL_PICK_TILT_INCREASE 5     /* tilt increase when troll-pick detected */
 
 /* Reset */
 #define FULL_RESET_SECONDS (7 * 24 * 3600)
@@ -112,13 +122,13 @@ typedef struct {
 
     /* Current picks (observables) */
     int currentRole;                 /* 1..ROLE_POOL */
-    char currentChampion[16];        /* "ChampXX" */
+    char currentChampion[24];        /* real champion name (e.g. "Ahri") */
 
     /* Observed tops inferred from counts */
     int topRoles[2];
     int topRolesCount;               /* 0..2 */
 
-    char topChampions[3][16];
+    char topChampions[3][24];
     int topChampionsCount;           /* 0..3 */
 
     int roleFreq[ROLE_POOL + 1];     /* index 1..ROLE_POOL */
@@ -135,6 +145,20 @@ typedef struct {
     int            is_smurf;         /* 1 if this player is a smurf, 0 otherwise  */
     HiddenMMRState hidden_mmr_state; /* current hidden MMR category               */
     int            tilt_level;       /* 0=none, 1=light tilt, 2=heavy tilt        */
+
+    /* LoL tier / division (visible rank) */
+    TierEnum tier;                   /* Iron..Master                              */
+    int      division;               /* 0=I, 1=II, 2=III, 3=IV (Master=0)        */
+
+    /* Role preferences (0-indexed: ROLE_TOP..ROLE_SUPPORT) */
+    int primaryRole;                 /* preferred main role                       */
+    int secondaryRole;               /* preferred secondary role                  */
+
+    /* Troll-pick tracking */
+    int   isTrollPick;               /* 1 if current pick is off-pool             */
+    float trollProbability;          /* current troll probability (%)             */
+    int   currentChampionId;         /* numeric id of champion picked this game   */
+    int   currentChampionRole;       /* role played with currentChampionId (0..4) */
 
     /* Histories (observables per match) */
     int ingamePingCountHistory[HISTORY_MAX];
@@ -176,14 +200,21 @@ static float rand01(void) {
     return (float)rand() / (float)RAND_MAX;
 }
 
-static void champNameFromId(int champId, char out[16]) {
-    snprintf(out, 16, "Champ%02d", champId);
+static void champNameFromId(int champId, char out[24]) {
+    const char *n = lolChampName(champId);
+    if (n[0] != '\0') {
+        snprintf(out, 24, "%s", n);
+    } else {
+        snprintf(out, 24, "Champ%03d", champId);
+    }
 }
 
 static int champIdFromName(const char *name) {
-    int id = 0;
-    if (sscanf(name, "Champ%02d", &id) == 1) return id;
-    return 0;
+    int id = lolChampIdByName(name);
+    if (id != 0) return id;
+    /* Fallback: parse legacy "ChampXXX" format */
+    sscanf(name, "Champ%03d", &id);
+    return id;
 }
 
 static void shufflePlayers(Player *players, int n) {
@@ -400,6 +431,11 @@ static float calculateHiddenFactor(Player *p) {
         }
     }
 
+    /* Troll pick penalty: off-pool pick detected */
+    if (p->isTrollPick) {
+        factor -= PENALTY_TROLL_PICK;
+    }
+
     if (factor < HIDDEN_FACTOR_MIN) factor = HIDDEN_FACTOR_MIN;
     return factor;
 }
@@ -409,8 +445,109 @@ static float effectiveMMR(Player *p) {
 }
 
 /* =========================
- * EOMM Core Functions
+ * Troll-pick / Champion selection
  * ========================= */
+
+/*
+ * calculateTrollProbability - return the current troll-pick probability (%).
+ * Base 5% + 2% per loss-streak step, capped at 60%.
+ */
+static float calculateTrollProbability(Player *p) {
+    float prob = BASE_TROLL_PROBABILITY + ((float)p->loseStreak * TROLL_FACTOR_PER_LOSS);
+    if (prob > TROLL_PROBABILITY_CAP) prob = TROLL_PROBABILITY_CAP;
+    return prob;
+}
+
+/*
+ * pickChampion - select a champion for this game using troll-probability logic.
+ *
+ * Normal pick  : choose from established mainChampionPool (topChampions).
+ * Troll pick   : choose any champion from the full pool at random.
+ * The isTrollPick flag is set and picked up later by calculateHiddenFactor().
+ */
+static void pickChampion(Player *p) {
+    float troll_prob = calculateTrollProbability(p);
+    p->trollProbability = troll_prob;
+
+    int troll_roll = rand_range(1, 100);
+    if ((float)troll_roll <= troll_prob) {
+        /* TROLL PICK: random champion outside the main pool */
+        int c;
+        int tries = 0;
+        do {
+            c = rand_range(1, CHAMP_POOL);
+            tries++;
+            /* If no established pool yet, any pick is fine */
+            if (p->topChampionsCount == 0) break;
+            /* Try to pick a champion NOT in the main pool */
+            int inPool = 0;
+            int i;
+            for (i = 0; i < p->topChampionsCount; i++) {
+                if (champIdFromName(p->topChampions[i]) == c) { inPool = 1; break; }
+            }
+            if (!inPool) break;
+        } while (tries < 10);
+
+        p->currentChampionId = c;
+        p->isTrollPick = 1;
+    } else {
+        /* NORMAL PICK: choose from main champion pool */
+        if (p->topChampionsCount > 0) {
+            int idx = rand_range(0, p->topChampionsCount - 1);
+            p->currentChampionId = champIdFromName(p->topChampions[idx]);
+            if (p->currentChampionId == 0) {
+                /* Fallback if name lookup fails */
+                p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
+            }
+        } else {
+            /* No established pool yet: pick from latent preferences */
+            p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
+        }
+        p->isTrollPick = 0;
+    }
+
+    /* Sync string name used by the rest of the simulation */
+    champNameFromId(p->currentChampionId, p->currentChampion);
+
+    /* Set champion role (0-indexed) for this game */
+    p->currentChampionRole = lolChampPrimaryRole(p->currentChampionId);
+}
+
+/*
+ * assignRole - set currentRole based on primary/secondary role preference.
+ *
+ * availableRoles[5]: 1 if the role (0..4) is still open in the team, 0 otherwise.
+ * The assigned role slot is marked 0 in availableRoles so the caller can track
+ * which roles have been taken when assigning multiple players in the same team.
+ * Falls back to a random available role if neither preference is available.
+ * currentRole is stored 1-indexed (1..ROLE_POOL) to match the rest of the code.
+ */
+static void assignRole(Player *p, int availableRoles[5]) {
+    int chosen = -1;
+    if (p->primaryRole >= 0 && p->primaryRole < 5 && availableRoles[p->primaryRole]) {
+        chosen = p->primaryRole;
+    } else if (p->secondaryRole >= 0 && p->secondaryRole < 5 && availableRoles[p->secondaryRole]) {
+        chosen = p->secondaryRole;
+    } else {
+        /* Neither preferred role available: pick any open role at random */
+        int choices[5];
+        int n = 0;
+        int r;
+        for (r = 0; r < 5; r++) {
+            if (availableRoles[r]) choices[n++] = r;
+        }
+        if (n > 0) {
+            chosen = choices[rand_range(0, n - 1)];
+        }
+    }
+
+    if (chosen >= 0) {
+        p->currentRole = chosen + 1;   /* convert 0-indexed to 1-indexed */
+        availableRoles[chosen] = 0;    /* mark role as taken in this team */
+    } else {
+        p->currentRole = rand_range(1, ROLE_POOL);
+    }
+}
 
 /*
  * calculateHiddenMMRState - Determine a player's hidden MMR category.
@@ -718,33 +855,6 @@ static void initUniqueTripleChamps(int out[3]) {
 }
 
 /* =========================
- * Picks based on off-schema
- * ========================= */
-static int pickRole(const Player *p, int offSchema) {
-    if (!offSchema) {
-        return p->prefRoles[rand_range(0, 1)];
-    }
-
-    int r;
-    do {
-        r = rand_range(1, ROLE_POOL);
-    } while (r == p->prefRoles[0] || r == p->prefRoles[1]);
-    return r;
-}
-
-static int pickChampId(const Player *p, int offSchema) {
-    if (!offSchema) {
-        return p->prefChampIds[rand_range(0, 2)];
-    }
-
-    int c;
-    do {
-        c = rand_range(1, CHAMP_POOL);
-    } while (c == p->prefChampIds[0] || c == p->prefChampIds[1] || c == p->prefChampIds[2]);
-    return c;
-}
-
-/* =========================
  * Signals: when offSchema -> amplify tilt signals
  * ========================= */
 static void simulateSignals(int offSchema, int *outPings, int *outChat, int *outDeaths, int *outClicks) {
@@ -802,25 +912,28 @@ static void simulateMatchAndUpdatePlayers(Match *matches, int numMatches) {
         int winner = (avgA >= globalAvg && avgA >= avgB) ? 0 : 1;
         matches[m].winner = winner;
 
+        /* Per-team role availability (all 5 roles open at match start) */
+        int availableRolesA[5] = {1, 1, 1, 1, 1};
+        int availableRolesB[5] = {1, 1, 1, 1, 1};
+
         for (int i = 0; i < TEAM_SIZE; i++) {
             Player *pa = matches[m].teamA[i];
             Player *pb = matches[m].teamB[i];
 
-            /* Off-schema probability depends on loseStreak */
+            /* Off-schema probability depends on loseStreak (used for signals) */
             float pOffA = clampf(OFF_BASE + OFF_STEP_PER_LOSS * (float)pa->loseStreak, 0.0f, OFF_CAP);
             float pOffB = clampf(OFF_BASE + OFF_STEP_PER_LOSS * (float)pb->loseStreak, 0.0f, OFF_CAP);
 
             int offA = (rand01() < pOffA) ? 1 : 0;
             int offB = (rand01() < pOffB) ? 1 : 0;
 
-            /* Choose picks */
-            pa->currentRole = pickRole(pa, offA);
-            pb->currentRole = pickRole(pb, offB);
+            /* Role assignment using primary/secondary role preferences (per-team tracking) */
+            assignRole(pa, availableRolesA);
+            assignRole(pb, availableRolesB);
 
-            int champA = pickChampId(pa, offA);
-            int champB = pickChampId(pb, offB);
-            champNameFromId(champA, pa->currentChampion);
-            champNameFromId(champB, pb->currentChampion);
+            /* Champion selection with troll-pick logic */
+            pickChampion(pa);
+            pickChampion(pb);
 
             /* Observe picks for inferred tops */
             observePick(pa);
@@ -849,9 +962,19 @@ static void simulateMatchAndUpdatePlayers(Match *matches, int numMatches) {
             if (aWon) pa->loseStreak = 0; else pa->loseStreak += 1;
             if (bWon) pb->loseStreak = 0; else pb->loseStreak += 1;
 
+            /* Troll pick tilt feedback: once per game, not per factor computation */
+            if (pa->isTrollPick) pa->tilt_level += TROLL_PICK_TILT_INCREASE;
+            if (pb->isTrollPick) pb->tilt_level += TROLL_PICK_TILT_INCREASE;
+
             /* MMR update */
             apply_mmr_result(pa, aWon);
             apply_mmr_result(pb, bWon);
+
+            /* Update visible tier/division from current MMR */
+            pa->tier     = mmrToTier(pa->visibleMMR);
+            pa->division = mmrToDivision(pa->visibleMMR, pa->tier);
+            pb->tier     = mmrToTier(pb->visibleMMR);
+            pb->division = mmrToDivision(pb->visibleMMR, pb->tier);
 
             time_t now = time(NULL);
             pa->lastMatchTime = now;
@@ -901,6 +1024,20 @@ static void initPlayer(Player *p, int idx) {
     p->is_smurf         = 0;
     p->hidden_mmr_state = HMR_NEUTRAL;
     p->tilt_level       = 0;
+
+    /* LoL tier / division (derived from starting MMR) */
+    p->tier     = mmrToTier(p->visibleMMR);
+    p->division = mmrToDivision(p->visibleMMR, p->tier);
+
+    /* Role preferences: map latent prefRoles (1-indexed) to 0-indexed LoL roles */
+    p->primaryRole   = p->prefRoles[0] - 1;   /* 1..5 => 0..4 */
+    p->secondaryRole = p->prefRoles[1] - 1;
+
+    /* Troll-pick state */
+    p->isTrollPick       = 0;
+    p->trollProbability  = BASE_TROLL_PROBABILITY;
+    p->currentChampionId = 0;
+    p->currentChampionRole = 0;
 
     p->historyCount = 0;
     for (int i = 0; i < HISTORY_MAX; i++) {
