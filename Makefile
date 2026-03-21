@@ -26,8 +26,13 @@ TEST_DEBUG_TARGET  = $(BIN_DIR)/test_debug_autofill
 TEST_DEBUG_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_debug_autofill.c
 TEST_DEBUG_INCLUDE = -I$(INC_DIR)
 
+# ── Coefficient analysis test target ──────────────────────
+TEST_COEFF_TARGET  = $(BIN_DIR)/test_coefficient_analysis
+TEST_COEFF_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_coefficient_analysis.c
+TEST_COEFF_INCLUDE = -I$(INC_DIR)
+
 # ── Default target ────────────────────────────────────────
-.PHONY: all build eomm clean run test test_autofill test_debug_autofill
+.PHONY: all build eomm clean run test test_autofill test_debug_autofill test_coefficient_analysis
 
 all: eomm
 
@@ -62,6 +67,12 @@ test_debug_autofill: $(BIN_DIR) $(TEST_DEBUG_TARGET)
 $(TEST_DEBUG_TARGET): $(TEST_DEBUG_SRCS) $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(TEST_DEBUG_INCLUDE) -o $@ $(TEST_DEBUG_SRCS)
 
+# Build coefficient analysis test
+test_coefficient_analysis: $(BIN_DIR) $(TEST_COEFF_TARGET)
+
+$(TEST_COEFF_TARGET): $(TEST_COEFF_SRCS) $(INC_DIR)/eomm_system.h
+	$(CC) $(CFLAGS) $(TEST_COEFF_INCLUDE) -o $@ $(TEST_COEFF_SRCS)
+
 # Run EOMM system (interactive)
 run: eomm
 	$(EOMM_TARGET)
@@ -70,7 +81,7 @@ run: eomm
 build: eomm
 
 # Test target
-test: test_autofill test_debug_autofill
+test: test_autofill test_debug_autofill test_coefficient_analysis
 	@echo "Running autofill test suite..."
 	$(TEST_AUTOFILL_TARGET)
 	@echo "Test suite complete."
@@ -78,6 +89,10 @@ test: test_autofill test_debug_autofill
 	@echo "Running autofill debug test..."
 	$(TEST_DEBUG_TARGET)
 	@echo "Debug test complete."
+	@echo ""
+	@echo "Running coefficient analysis test..."
+	$(TEST_COEFF_TARGET)
+	@echo "Coefficient analysis complete."
 
 # Clean
 clean:
