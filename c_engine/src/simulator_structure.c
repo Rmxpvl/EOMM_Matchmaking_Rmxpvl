@@ -71,6 +71,33 @@
 /* Baseline chat EMA */
 #define CHAT_BASELINE_EMA_ALPHA 0.10f
 
+/* ========================= */
+/* EOMM system constants     */
+/* ========================= */
+#define N_SMURFS                        30
+/* N_TOTAL_PLAYERS documents the intended pool size (must equal N_PLAYERS). */
+#define N_TOTAL_PLAYERS                 300
+#define TILT_TEAM_MIN                   3
+#define HEALTHY_TEAM_MIN                3
+#define MAX_SMURFS_PER_TEAM             1
+#define VISIBLE_MMR_TOLERANCE           200.0f
+#define SMURF_WINNING_CHANCE            70
+#define SMURF_LOSING_REINFORCED_CHANCE  20
+
+/* Hidden MMR state: reflects tilt/health of a player */
+typedef enum {
+    HMR_NEGATIVE = -1,  /* in tilt / degraded state */
+    HMR_NEUTRAL  =  0,  /* normal state             */
+    HMR_POSITIVE =  1   /* healthy / hot streak     */
+} HiddenMMRState;
+
+/* Smurf placement outcome (weighted random 70/20/10) */
+typedef enum {
+    SMURF_WINNING_TEAM       = 0, /* 70%: place in winning team                        */
+    SMURF_LOSING_REINFORCED  = 1, /* 20%: losing team, replace 1 heavy-tilt with neutral*/
+    SMURF_LOSING_STANDARD    = 2  /* 10%: losing team, standard 3 heavy-tilt            */
+} SmurfPlacement;
+
 typedef struct {
     char name[16];
 
@@ -103,6 +130,11 @@ typedef struct {
 
     /* Tilt state */
     int loseStreak;
+
+    /* EOMM fields */
+    int            is_smurf;         /* 1 if this player is a smurf, 0 otherwise  */
+    HiddenMMRState hidden_mmr_state; /* current hidden MMR category               */
+    int            tilt_level;       /* 0=none, 1=light tilt, 2=heavy tilt        */
 
     /* Histories (observables per match) */
     int ingamePingCountHistory[HISTORY_MAX];
@@ -160,6 +192,15 @@ static void shufflePlayers(Player *players, int n) {
         Player tmp = players[i];
         players[i] = players[j];
         players[j] = tmp;
+    }
+}
+
+static void shufflePlayerPtrs(Player **arr, int n) {
+    for (int i = n - 1; i > 0; --i) {
+        int j = rand() % (i + 1);
+        Player *tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
     }
 }
 
@@ -368,18 +409,254 @@ static float effectiveMMR(Player *p) {
 }
 
 /* =========================
- * Matchmaking (kept concept)
+ * EOMM Core Functions
  * ========================= */
-static int cmp_effective_desc(const void *a, const void *b) {
-    Player *pa = *(Player**)a;
-    Player *pb = *(Player**)b;
-    float ea = effectiveMMR(pa);
-    float eb = effectiveMMR(pb);
-    if (ea < eb) return 1;
-    if (ea > eb) return -1;
-    return 0;
+
+/*
+ * calculateHiddenMMRState - Determine a player's hidden MMR category.
+ * Also updates p->tilt_level (0=none, 1=light, 2=heavy).
+ *
+ * Rules:
+ *   - loseStreak >= 3 OR factor <= 0.70  => heavy tilt  => NEGATIVE
+ *   - loseStreak >  0 OR factor <  0.90  => light tilt  => NEGATIVE
+ *   - factor >= 0.95 and loseStreak == 0 => POSITIVE
+ *   - otherwise                          => NEUTRAL
+ */
+static HiddenMMRState calculateHiddenMMRState(Player *p) {
+    float factor = calculateHiddenFactor(p);
+
+    if (p->loseStreak >= 3 || factor <= 0.70f) {
+        p->tilt_level = 2;
+        return HMR_NEGATIVE;
+    }
+    if (p->loseStreak > 0 || factor < 0.90f) {
+        p->tilt_level = 1;
+        return HMR_NEGATIVE;
+    }
+    p->tilt_level = 0;
+    return (factor >= 0.95f) ? HMR_POSITIVE : HMR_NEUTRAL;
 }
 
+/*
+ * selectTiltPlayers - Fill `out` with up to `maxOut` players that have
+ * negative hidden MMR from `pool`.  Heavy tilt (level 2) is preferred
+ * over light tilt (level 1) to maximize the losing-team effect.
+ */
+static int selectTiltPlayers(Player **pool, int poolSize, Player **out, int maxOut) {
+    int count = 0;
+    for (int pass = 2; pass >= 1 && count < maxOut; pass--) {
+        for (int i = 0; i < poolSize && count < maxOut; i++) {
+            if (pool[i]->hidden_mmr_state == HMR_NEGATIVE && pool[i]->tilt_level == pass) {
+                out[count++] = pool[i];
+            }
+        }
+    }
+    return count;
+}
+
+/*
+ * selectHealthyPlayers - Fill `out` with up to `maxOut` players that have
+ * neutral or positive hidden MMR from `pool`.
+ */
+static int selectHealthyPlayers(Player **pool, int poolSize, Player **out, int maxOut) {
+    int count = 0;
+    for (int i = 0; i < poolSize && count < maxOut; i++) {
+        if (pool[i]->hidden_mmr_state != HMR_NEGATIVE) {
+            out[count++] = pool[i];
+        }
+    }
+    return count;
+}
+
+/*
+ * placeSmurf - Weighted random smurf placement.
+ *   70% -> SMURF_WINNING_TEAM
+ *   20% -> SMURF_LOSING_REINFORCED  (losing team with lighter tilt composition)
+ *   10% -> SMURF_LOSING_STANDARD    (losing team with normal heavy-tilt composition)
+ */
+static SmurfPlacement placeSmurf(void) {
+    int roll = rand_range(1, 100);
+    if (roll <= SMURF_WINNING_CHANCE)
+        return SMURF_WINNING_TEAM;
+    if (roll <= SMURF_WINNING_CHANCE + SMURF_LOSING_REINFORCED_CHANCE)
+        return SMURF_LOSING_REINFORCED;
+    return SMURF_LOSING_STANDARD;
+}
+
+/*
+ * validateTeamMMRBalance - Return 1 if the max visible-MMR difference between
+ * any two players in the match is within VISIBLE_MMR_TOLERANCE, 0 otherwise.
+ */
+static int validateTeamMMRBalance(const Match *m) {
+    float minMMR =  1e9f;
+    float maxMMR = -1.0f;
+    for (int i = 0; i < TEAM_SIZE; i++) {
+        if (m->teamA[i]) {
+            float v = m->teamA[i]->visibleMMR;
+            if (v < minMMR) minMMR = v;
+            if (v > maxMMR) maxMMR = v;
+        }
+        if (m->teamB[i]) {
+            float v = m->teamB[i]->visibleMMR;
+            if (v < minMMR) minMMR = v;
+            if (v > maxMMR) maxMMR = v;
+        }
+    }
+    if (minMMR > maxMMR) return 1; /* minMMR=1e9f > maxMMR=-1.0f means no players assigned */
+    return (maxMMR - minMMR) <= VISIBLE_MMR_TOLERANCE;
+}
+
+/*
+ * createMatchWithEOMM - Build matches using the full EOMM strategy:
+ *
+ *  Losing team  (teamA): 3 tilt players  (negative hidden MMR)
+ *  Winning team (teamB): 3 healthy players (neutral/positive hidden MMR)
+ *  Smurf       (opt.)  : 1 per team max, weighted placement 70/20/10
+ *  Random      (4 left): distributed to balance each team to 5 players
+ *
+ * Visible MMR balance (±200) is validated per match; teams that cannot
+ * satisfy the constraint fall back to any available unassigned player.
+ */
+static void createMatchWithEOMM(Player *players, int nPlayers, Match *matches, int *numMatches) {
+    int nm = nPlayers / MATCH_SIZE;
+    *numMatches = nm;
+
+    /* Pre-compute hidden MMR state for every player once per round */
+    for (int i = 0; i < nPlayers; i++) {
+        players[i].hidden_mmr_state = calculateHiddenMMRState(&players[i]);
+    }
+
+    int *assigned = (int*)calloc(nPlayers, sizeof(int));
+    if (!assigned) return;
+
+    /* Pool arrays reused across matches to avoid repeated stack allocation */
+    Player **smurfPool  = (Player**)malloc(sizeof(Player*) * nPlayers);
+    Player **tiltPool   = (Player**)malloc(sizeof(Player*) * nPlayers);
+    Player **healthyPool = (Player**)malloc(sizeof(Player*) * nPlayers);
+    Player **remaining  = (Player**)malloc(sizeof(Player*) * nPlayers);
+
+    if (!smurfPool || !tiltPool || !healthyPool || !remaining) {
+        free(smurfPool); free(tiltPool); free(healthyPool); free(remaining);
+        free(assigned);
+        return;
+    }
+
+    for (int m = 0; m < nm; m++) {
+        Match *match = &matches[m];
+        match->sumEffectiveA = 0.0f;
+        match->sumEffectiveB = 0.0f;
+        match->winner = -1;
+        for (int i = 0; i < TEAM_SIZE; i++) {
+            match->teamA[i] = NULL;
+            match->teamB[i] = NULL;
+        }
+
+        /* ---- Categorise available (unassigned) players ---- */
+        int smurfN = 0, tiltN = 0, healthyN = 0;
+
+        for (int i = 0; i < nPlayers; i++) {
+            if (assigned[i]) continue;
+            Player *p = &players[i];
+            if (p->is_smurf) {
+                smurfPool[smurfN++] = p;
+            } else if (p->hidden_mmr_state == HMR_NEGATIVE) {
+                tiltPool[tiltN++] = p;
+            } else {
+                healthyPool[healthyN++] = p;
+            }
+        }
+
+        /* Shuffle pools to introduce randomness within each category */
+        shufflePlayerPtrs(smurfPool,   smurfN);
+        shufflePlayerPtrs(tiltPool,    tiltN);
+        shufflePlayerPtrs(healthyPool, healthyN);
+
+        int aCount = 0, bCount = 0;
+        int smurfInA = 0;
+
+        /* ---- Smurf placement (max 1 smurf per team) ---- */
+        Player *selectedSmurf = (smurfN > 0) ? smurfPool[0] : NULL;
+        SmurfPlacement smurfPos = SMURF_WINNING_TEAM;
+
+        if (selectedSmurf) {
+            smurfPos = placeSmurf();
+            assigned[selectedSmurf - players] = 1;
+
+            if (smurfPos == SMURF_WINNING_TEAM) {
+                match->teamB[bCount++] = selectedSmurf;
+            } else {
+                match->teamA[aCount++] = selectedSmurf;
+                smurfInA = 1;
+            }
+        }
+
+        /* ---- Fill losing team (teamA) with tilt players ---- */
+        /*
+         * Reinforced placement: the smurf takes the 3rd heavy-tilt slot.
+         * Only 2 tilt players are explicitly selected; the remaining slot
+         * is filled from the random pool (which may be neutral/lighter).
+         */
+        int tiltNeeded = TILT_TEAM_MIN;
+        if (smurfInA && smurfPos == SMURF_LOSING_REINFORCED) {
+            tiltNeeded = 2;
+        }
+
+        Player *tiltSelected[TILT_TEAM_MIN];
+        int tiltSelectedN = selectTiltPlayers(tiltPool, tiltN, tiltSelected, tiltNeeded);
+
+        for (int t = 0; t < tiltSelectedN; t++) {
+            match->teamA[aCount++] = tiltSelected[t];
+            assigned[tiltSelected[t] - players] = 1;
+        }
+
+        /* ---- Fill winning team (teamB) with healthy players ---- */
+        Player *healthySelected[HEALTHY_TEAM_MIN];
+        int healthySelectedN = selectHealthyPlayers(healthyPool, healthyN, healthySelected, HEALTHY_TEAM_MIN);
+
+        for (int h = 0; h < healthySelectedN; h++) {
+            match->teamB[bCount++] = healthySelected[h];
+            assigned[healthySelected[h] - players] = 1;
+        }
+
+        /* ---- Distribute remaining 4 players randomly ---- */
+        /* Collect all unassigned players; shuffle for unpredictability */
+        int remainingN = 0;
+        for (int i = 0; i < nPlayers; i++) {
+            if (!assigned[i]) remaining[remainingN++] = &players[i];
+        }
+        shufflePlayerPtrs(remaining, remainingN);
+
+        /* Distribute evenly: favour the team with fewer players first.
+         * The OR condition stops the loop once both teams reach TEAM_SIZE;
+         * the inner guards ensure neither count ever exceeds TEAM_SIZE. */
+        for (int r = 0; r < remainingN && (aCount < TEAM_SIZE || bCount < TEAM_SIZE); r++) {
+            if (aCount < bCount && aCount < TEAM_SIZE) {
+                match->teamA[aCount++] = remaining[r];
+            } else if (bCount < TEAM_SIZE) {
+                match->teamB[bCount++] = remaining[r];
+            } else if (aCount < TEAM_SIZE) {
+                match->teamA[aCount++] = remaining[r];
+            }
+            assigned[remaining[r] - players] = 1;
+        }
+
+        /* ---- Verify visible MMR balance (informational; logged to stderr) ---- */
+        if (!validateTeamMMRBalance(match)) {
+            fprintf(stderr, "[EOMM] Match %d: visible MMR spread > %.0f (teams may appear unbalanced)\n",
+                    m, VISIBLE_MMR_TOLERANCE);
+        }
+    }
+
+    free(smurfPool);
+    free(tiltPool);
+    free(healthyPool);
+    free(remaining);
+    free(assigned);
+}
+
+/* =========================
+ * Matchmaking helpers
+ * ========================= */
 static void placeInitialTeams(Player *players, int nPlayers, Match *matches, int *numMatches) {
     shufflePlayers(players, nPlayers);
 
@@ -399,41 +676,13 @@ static void placeInitialTeams(Player *players, int nPlayers, Match *matches, int
     }
 }
 
+/*
+ * createMatchAdvanced - Entry point for post-game-1 matchmaking.
+ * Delegates to createMatchWithEOMM so that all matches after the
+ * random first game use the full EOMM engagement-optimized logic.
+ */
 static void createMatchAdvanced(Player *players, int nPlayers, Match *matches, int *numMatches) {
-    int nm = nPlayers / MATCH_SIZE;
-    *numMatches = nm;
-
-    Player **sorted = (Player**)malloc(sizeof(Player*) * nPlayers);
-    for (int i = 0; i < nPlayers; i++) sorted[i] = &players[i];
-    qsort(sorted, nPlayers, sizeof(Player*), cmp_effective_desc);
-
-    for (int m = 0; m < nm; m++) {
-        matches[m].sumEffectiveA = 0.0f;
-        matches[m].sumEffectiveB = 0.0f;
-        matches[m].winner = -1;
-
-        for (int i = 0; i < TEAM_SIZE; i++) { matches[m].teamA[i] = NULL; matches[m].teamB[i] = NULL; }
-
-        int aCount = 0, bCount = 0;
-        int base = m * MATCH_SIZE;
-
-        /* Snake: A B B A ... */
-        for (int k = 0; k < MATCH_SIZE; k++) {
-            Player *p = sorted[base + k];
-            int mod = k % 4;
-            int pickToA = (mod == 0 || mod == 3);
-
-            if (pickToA) {
-                if (aCount < TEAM_SIZE) matches[m].teamA[aCount++] = p;
-                else matches[m].teamB[bCount++] = p;
-            } else {
-                if (bCount < TEAM_SIZE) matches[m].teamB[bCount++] = p;
-                else matches[m].teamA[aCount++] = p;
-            }
-        }
-    }
-
-    free(sorted);
+    createMatchWithEOMM(players, nPlayers, matches, numMatches);
 }
 
 /* =========================
@@ -648,6 +897,11 @@ static void initPlayer(Player *p, int idx) {
 
     p->loseStreak = 0;
 
+    /* EOMM fields */
+    p->is_smurf         = 0;
+    p->hidden_mmr_state = HMR_NEUTRAL;
+    p->tilt_level       = 0;
+
     p->historyCount = 0;
     for (int i = 0; i < HISTORY_MAX; i++) {
         p->ingamePingCountHistory[i] = 0;
@@ -670,6 +924,19 @@ int main(void) {
     Player players[N_PLAYERS];
     for (int i = 0; i < N_PLAYERS; i++) initPlayer(&players[i], i);
 
+    /* Randomly select N_SMURFS distinct players to be smurfs
+     * (N_SMURFS / N_PLAYERS = 10% of playerbase).
+     * Uses a partial Fisher-Yates shuffle on an index array to avoid bias. */
+    {
+        int idx[N_PLAYERS];
+        for (int i = 0; i < N_PLAYERS; i++) idx[i] = i;
+        for (int i = 0; i < N_SMURFS; i++) {
+            int j = i + rand() % (N_PLAYERS - i);
+            int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+            players[idx[i]].is_smurf = 1;
+        }
+    }
+
     Match matches[N_PLAYERS / MATCH_SIZE];
     int numMatches = 0;
 
@@ -688,9 +955,21 @@ int main(void) {
     printf("Simulation finished. Sample players:\n");
     for (int i = 0; i < 10; i++) {
         Player *p = &players[i];
-        printf("%s mmr=%.0f factor=%.2f chatBaseline=%.2f loseStreak=%d W=%d L=%d G=%d topRolesCount=%d topChampsCount=%d\n",
+        printf("%s mmr=%.0f factor=%.2f chatBaseline=%.2f loseStreak=%d W=%d L=%d G=%d "
+               "topRolesCount=%d topChampsCount=%d smurf=%d tilt=%d\n",
                p->name, p->visibleMMR, calculateHiddenFactor(p), p->chatBaselineAvg, p->loseStreak,
-               p->wins, p->losses, p->totalGames, p->topRolesCount, p->topChampionsCount);
+               p->wins, p->losses, p->totalGames, p->topRolesCount, p->topChampionsCount,
+               p->is_smurf, p->tilt_level);
+    }
+
+    /* EOMM smurf winrate summary */
+    printf("\nSmurf winrate summary (%d smurfs):\n", N_SMURFS);
+    for (int i = 0; i < N_PLAYERS; i++) {
+        Player *p = &players[i];
+        if (!p->is_smurf) continue;
+        float wr = (p->totalGames > 0) ? (100.0f * (float)p->wins / (float)p->totalGames) : 0.0f;
+        printf("  %s mmr=%.0f W=%d L=%d G=%d winrate=%.1f%%\n",
+               p->name, p->visibleMMR, p->wins, p->losses, p->totalGames, wr);
     }
 
     return 0;
