@@ -31,8 +31,14 @@ TEST_COEFF_TARGET  = $(BIN_DIR)/test_coefficient_analysis
 TEST_COEFF_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_coefficient_analysis.c
 TEST_COEFF_INCLUDE = -I$(INC_DIR)
 
+# ── Performance stats test target ────────────────────────
+TEST_PERF_TARGET  = $(BIN_DIR)/test_performance_stats
+TEST_PERF_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_performance_stats.c
+TEST_PERF_INCLUDE = -I$(INC_DIR)
+TEST_PERF_CFLAGS  = -Wall -Wextra -std=c99 -lm
+
 # ── Default target ────────────────────────────────────────
-.PHONY: all build eomm clean run test test_autofill test_debug_autofill test_coefficient_analysis
+.PHONY: all build eomm clean run test test_autofill test_debug_autofill test_coefficient_analysis test_performance_stats
 
 all: eomm
 
@@ -73,6 +79,12 @@ test_coefficient_analysis: $(BIN_DIR) $(TEST_COEFF_TARGET)
 $(TEST_COEFF_TARGET): $(TEST_COEFF_SRCS) $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(TEST_COEFF_INCLUDE) -o $@ $(TEST_COEFF_SRCS)
 
+# Build performance stats test
+test_performance_stats: $(BIN_DIR) $(TEST_PERF_TARGET)
+
+$(TEST_PERF_TARGET): $(TEST_PERF_SRCS) $(INC_DIR)/eomm_system.h
+	$(CC) $(CFLAGS) $(TEST_PERF_INCLUDE) -o $@ $(TEST_PERF_SRCS) -lm
+
 # Run EOMM system (interactive)
 run: eomm
 	$(EOMM_TARGET)
@@ -81,7 +93,7 @@ run: eomm
 build: eomm
 
 # Test target
-test: test_autofill test_debug_autofill test_coefficient_analysis
+test: test_autofill test_debug_autofill test_coefficient_analysis test_performance_stats
 	@echo "Running autofill test suite..."
 	$(TEST_AUTOFILL_TARGET)
 	@echo "Test suite complete."
@@ -93,6 +105,10 @@ test: test_autofill test_debug_autofill test_coefficient_analysis
 	@echo "Running coefficient analysis test..."
 	$(TEST_COEFF_TARGET)
 	@echo "Coefficient analysis complete."
+	@echo ""
+	@echo "Running performance stats test..."
+	$(TEST_PERF_TARGET)
+	@echo "Performance stats test complete."
 
 # Clean
 clean:

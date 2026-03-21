@@ -4,15 +4,16 @@
  * EOMM (Engagement Optimized Matchmaking) — core mechanics implementation.
  *
  * Implements:
- *   1. Player initialisation with skill-based win rates
- *   2. Troll probability (arrogance + win-streak based)
- *   3. Troll penalty (hidden_factor reduction, escalates with consecutive trolls)
- *   4. Tilt factor system (lose streaks degrade state)
- *   5. Hidden state tracking (NEGATIVE / NEUTRAL / POSITIVE)
- *   6. Soft resets (every 14 games)
- *   7. Dynamic EOMM matchmaking (tilt → losing team, healthy → winning team)
- *   8. Match simulation (MMR × hidden_factor × skill win-rate)
- *   9. Analytics / reporting
+ *   1. Player initialisation with skill-based PerformanceStats (no fixed win rates)
+ *   2. Dynamic win rate calculation from performance attributes
+ *   3. Troll probability (arrogance + win-streak based)
+ *   4. Troll penalty (hidden_factor reduction, escalates with consecutive trolls)
+ *   5. Tilt factor system (lose streaks degrade state)
+ *   6. Hidden state tracking (NEGATIVE / NEUTRAL / POSITIVE)
+ *   7. Soft resets (every 14 games)
+ *   8. Dynamic EOMM matchmaking (tilt → losing team, healthy → winning team)
+ *   9. Match simulation (MMR × hidden_factor × calculated win-rate)
+ *  10. Analytics / reporting
  */
 
 #include "../include/eomm_system.h"
@@ -86,11 +87,59 @@ void init_player(Player *p, int id, SkillLevel skill) {
     snprintf(p->name, PLAYER_NAME_LEN, "Player%04d", id + 1);
 
     p->skill_level = skill;
+
+    /* Initialise independent PerformanceStats based on skill level.
+     *
+     * Each stat is drawn uniformly from the skill-level range so that
+     * every player has a unique profile.  After all stats are set, one
+     * randomly chosen stat is adjusted (upward for hardstuck, downward
+     * for smurfs, either for normals) to create additional variance and
+     * avoid players that are purely uniform.
+     *
+     * Ranges (before the single-stat adjustment):
+     *   SMURF     : [0.70, 0.90]
+     *   NORMAL    : [0.30, 0.70]
+     *   HARDSTUCK : [0.10, 0.35]
+     */
+    float lo, hi, adj_delta;
     switch (skill) {
-        case SKILL_SMURF:     p->win_rate = 0.58f; break;
-        case SKILL_HARDSTUCK: p->win_rate = 0.42f; break;
-        default:              p->win_rate = 0.50f; break;
+        case SKILL_SMURF:
+            lo = 0.70f; hi = 0.90f;
+            adj_delta = -0.10f; /* one weaker stat */
+            break;
+        case SKILL_HARDSTUCK:
+            lo = 0.10f; hi = 0.35f;
+            adj_delta = +0.10f; /* one stronger stat */
+            break;
+        default: /* SKILL_NORMAL */
+            lo = 0.30f; hi = 0.70f;
+            adj_delta = (randf() < 0.5f) ? +0.10f : -0.10f;
+            break;
     }
+
+    float range = hi - lo;
+    p->perf.mechanical_skill      = lo + randf() * range;
+    p->perf.decision_making       = lo + randf() * range;
+    p->perf.map_awareness         = lo + randf() * range;
+    p->perf.tilt_resistance       = lo + randf() * range;
+    p->perf.champion_pool_depth   = lo + randf() * range;
+    p->perf.champion_proficiency  = lo + randf() * range;
+    p->perf.wave_management       = lo + randf() * range;
+    p->perf.teamfight_positioning = lo + randf() * range;
+
+    /* Apply the single-stat adjustment to a random stat index */
+    float *stats[8] = {
+        &p->perf.mechanical_skill,
+        &p->perf.decision_making,
+        &p->perf.map_awareness,
+        &p->perf.tilt_resistance,
+        &p->perf.champion_pool_depth,
+        &p->perf.champion_proficiency,
+        &p->perf.wave_management,
+        &p->perf.teamfight_positioning
+    };
+    int adj_idx = rand() % 8;
+    *stats[adj_idx] = clampf(*stats[adj_idx] + adj_delta, 0.0f, 1.0f);
 
     p->visible_mmr   = START_MMR;
     p->hidden_factor = HIDDEN_FACTOR_START;
@@ -326,6 +375,54 @@ float effective_mmr(const Player *p) {
 }
 
 /* =========================================================
+ * Performance-based win rate
+ * ========================================================= */
+
+/*
+ * calculate_actual_winrate — derive a player's win probability from their
+ * PerformanceStats rather than a pre-assigned fixed value.
+ *
+ * Algorithm:
+ *   1. Compute the weighted average of all eight performance stats.
+ *      (Equal weights; tilt_resistance is included in the average so that
+ *      players with higher mental stability also have a higher baseline WR.)
+ *   2. Map the average performance [0, 1] linearly to win rate [25%, 75%]:
+ *        win_rate = 0.25 + avg_perf * 0.50
+ *      This centres normal players (avg ~0.50) at exactly 50% WR while
+ *      smurfs (avg ~0.80) land near 65% and hardstuck (avg ~0.225) near 36%.
+ *   3. Apply a tilt penalty when the player is in STATE_NEGATIVE.
+ *      The penalty scales with low tilt_resistance so emotionally fragile
+ *      players suffer more when on a losing streak.
+ *   4. Clamp the final value to [0.25, 0.75].
+ *
+ * The actual observed win rate in the simulation will differ from this
+ * per-game value because EOMM matchmaking adjusts opponent difficulty as
+ * each player's MMR evolves.
+ */
+float calculate_actual_winrate(const Player *p) {
+    /* Equal-weight average of all eight performance stats */
+    float avg = (p->perf.mechanical_skill
+               + p->perf.decision_making
+               + p->perf.map_awareness
+               + p->perf.tilt_resistance
+               + p->perf.champion_pool_depth
+               + p->perf.champion_proficiency
+               + p->perf.wave_management
+               + p->perf.teamfight_positioning) / 8.0f;
+
+    /* Map [0, 1] performance to [0.25, 0.75] win rate */
+    float wr = 0.25f + avg * 0.50f;
+
+    /* Tilt penalty: emotionally fragile players drop further when negative */
+    if (p->hidden_state == STATE_NEGATIVE) {
+        float fragility = 1.0f - p->perf.tilt_resistance;
+        wr -= fragility * 0.05f; /* up to -5% for zero tilt_resistance */
+    }
+
+    return clampf(wr, 0.25f, 0.75f);
+}
+
+/* =========================================================
  * Troll pick determination
  * ========================================================= */
 
@@ -356,7 +453,9 @@ void determine_troll_picks(Match *m) {
 /*
  * simulate_match — determine match winner based on team power.
  *
- * Team power = sum of (effective_mmr * win_rate) for each player.
+ * Team power = sum of (effective_mmr * calculate_actual_winrate) for each player.
+ * Win rate is computed dynamically from each player's PerformanceStats so that
+ * skill differences emerge from behaviour rather than pre-assigned constants.
  * Win probability for team_a = power_a / (power_a + power_b).
  * Result is stochastic (random roll against win probability).
  *
@@ -368,8 +467,8 @@ int simulate_match(Match *m) {
     float power_a = 0.0f, power_b = 0.0f;
 
     for (int i = 0; i < TEAM_SIZE; i++) {
-        power_a += effective_mmr(m->team_a[i]) * m->team_a[i]->win_rate;
-        power_b += effective_mmr(m->team_b[i]) * m->team_b[i]->win_rate;
+        power_a += effective_mmr(m->team_a[i]) * calculate_actual_winrate(m->team_a[i]);
+        power_b += effective_mmr(m->team_b[i]) * calculate_actual_winrate(m->team_b[i]);
     }
 
     float total = power_a + power_b;

@@ -5,9 +5,11 @@
  * Defines all structures, constants, enums and function declarations.
  *
  * Player distribution:
- *   10% Smurfs    (skill: 58% WR, high arrogance → high troll chance)
- *   10% Hardstuck (skill: 42% WR, low confidence → low troll chance)
- *   80% Normal    (skill: 50% WR)
+ *   10% Smurfs    (high performance stats 70-90% → win rate emerges ~56-60%)
+ *   10% Hardstuck (low performance stats 10-35%  → win rate emerges ~35-42%)
+ *   80% Normal    (variable stats 30-70%          → win rate emerges ~48-52%)
+ *
+ * Win rates are NOT pre-assigned; they emerge dynamically from PerformanceStats.
  *
  * All players start at MMR 1000 (Silver).
  * Placement phase: 10 games, K-factor 30.
@@ -100,12 +102,12 @@
 
 /*
  * SkillLevel — permanent skill category assigned at player creation.
- * Determines the player's base win-rate contribution.
+ * Determines the player's performance stat ranges; win rate emerges from stats.
  */
 typedef enum {
-    SKILL_NORMAL    = 0,  /* 80% of players — 50% base WR  */
-    SKILL_SMURF     = 1,  /* 10% of players — 58% base WR  */
-    SKILL_HARDSTUCK = 2   /* 10% of players — 42% base WR  */
+    SKILL_NORMAL    = 0,  /* 80% of players — stats 30-70%  (WR emerges ~48-52%) */
+    SKILL_SMURF     = 1,  /* 10% of players — stats 70-90%  (WR emerges ~56-60%) */
+    SKILL_HARDSTUCK = 2   /* 10% of players — stats 10-35%  (WR emerges ~35-42%) */
 } SkillLevel;
 
 /*
@@ -127,6 +129,28 @@ typedef enum {
  * ========================================================= */
 
 /*
+ * PerformanceStats — independent skill attributes for one player.
+ *
+ * Each stat is in [0, 1].  Ranges by skill level:
+ *   SMURF     : 70-90%  (globally high; one stat may dip to ~60%)
+ *   NORMAL    : 30-70%  (high variance; each stat truly independent)
+ *   HARDSTUCK : 10-35%  (globally low; one stat may reach ~40%)
+ *
+ * Win rate is NOT stored here; it is computed dynamically by
+ * calculate_actual_winrate() from a weighted average of these stats.
+ */
+typedef struct {
+    float mechanical_skill;      /* CSing, combat, positioning   */
+    float decision_making;       /* Macro, objectives, timing    */
+    float map_awareness;         /* Vision, information usage    */
+    float tilt_resistance;       /* Emotional stability          */
+    float champion_pool_depth;   /* Champion pool diversity      */
+    float champion_proficiency;  /* Champion mastery level       */
+    float wave_management;       /* Wave control, freeze timing  */
+    float teamfight_positioning; /* Teamfight positioning        */
+} PerformanceStats;
+
+/*
  * Player — full player state for one simulation agent.
  */
 typedef struct {
@@ -134,8 +158,8 @@ typedef struct {
     char name[PLAYER_NAME_LEN];
 
     /* Skill profile (fixed at creation) */
-    SkillLevel skill_level;
-    float      win_rate;     /* base win probability: 0.50 / 0.58 / 0.42 */
+    SkillLevel     skill_level;
+    PerformanceStats perf;       /* independent performance attributes */
 
     /* Visible MMR (what the player sees) */
     float visible_mmr;
@@ -200,6 +224,13 @@ typedef struct {
 /* --- Player initialisation --- */
 void init_player(Player *p, int id, SkillLevel skill);
 void init_players(Player *players, int n);
+
+/* --- Performance-based win rate --- */
+
+/* Compute the player's current win probability from their PerformanceStats.
+ * Returns a value in [0.25, 0.75]; applies a tilt penalty when the player
+ * is in STATE_NEGATIVE.  Called at match time instead of using a fixed rate. */
+float calculate_actual_winrate(const Player *p);
 
 /* --- EOMM core mechanics --- */
 
