@@ -56,6 +56,13 @@
 /* Matchmaking balance tolerance (visible MMR spread) */
 #define MMR_BALANCE_TOLERANCE   200.0f
 
+/* Compensation boost for players on 7+ consecutive losses */
+#define COMPENSATION_THRESHOLD  7       /* activate at 7 consecutive losses */
+#define COMPENSATION_MAX_BONUS  0.50f   /* 50% max win-probability boost    */
+#define COMPENSATION_BONUS_7    0.15f   /* +15% boost at exactly 7 losses   */
+#define COMPENSATION_BONUS_8    0.25f   /* +25% boost at exactly 8 losses   */
+#define COMPENSATION_BONUS_9    0.35f   /* +35% boost at exactly 9 losses   */
+
 /* Team / match sizes */
 #define TEAM_SIZE   5
 #define MATCH_SIZE  (TEAM_SIZE * 2)

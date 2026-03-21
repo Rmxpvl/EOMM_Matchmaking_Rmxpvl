@@ -27,6 +27,32 @@ static float clampf(float x, float lo, float hi) {
     return x;
 }
 
+/*
+ * get_compensation_bonus — returns the win-probability bonus for a player
+ * who has suffered COMPENSATION_THRESHOLD or more consecutive losses.
+ *
+ * Gradual escalation:
+ *   7  losses → +15%
+ *   8  losses → +25%
+ *   9  losses → +35%
+ *  10+ losses → +50% (capped at COMPENSATION_MAX_BONUS)
+ */
+static inline float get_compensation_bonus(int lose_streak) {
+    if (lose_streak < COMPENSATION_THRESHOLD) return 0.0f;
+
+    float bonus;
+    if (lose_streak == 7) {
+        bonus = COMPENSATION_BONUS_7;
+    } else if (lose_streak == 8) {
+        bonus = COMPENSATION_BONUS_8;
+    } else if (lose_streak == 9) {
+        bonus = COMPENSATION_BONUS_9;
+    } else {
+        bonus = COMPENSATION_MAX_BONUS;
+    }
+    return bonus;
+}
+
 static float randf(void) {
     return (float)rand() / (float)RAND_MAX;
 }
@@ -324,6 +350,10 @@ void determine_troll_picks(Match *m) {
  * Team power = sum of (effective_mmr * win_rate) for each player.
  * Win probability for team_a = power_a / (power_a + power_b).
  * Result is stochastic (random roll against win probability).
+ *
+ * Compensation boost: if any team_a player has >= COMPENSATION_THRESHOLD
+ * consecutive losses the highest applicable bonus is applied to win_prob_a
+ * and clamped to [0.05, 0.95].  This is transparent to the player.
  */
 int simulate_match(Match *m) {
     float power_a = 0.0f, power_b = 0.0f;
@@ -335,6 +365,19 @@ int simulate_match(Match *m) {
 
     float total = power_a + power_b;
     float win_prob_a = (total > 0.0f) ? (power_a / total) : 0.5f;
+
+    /* Apply compensation bonus for team_a players on a long losing streak.
+     * Only team_a is checked because the EOMM matchmaker deliberately places
+     * tilted/losing players on team_a; team_b is the "stronger" side by
+     * design, so compensating team_b would cancel the EOMM intent. */
+    float max_bonus = 0.0f;
+    for (int i = 0; i < TEAM_SIZE; i++) {
+        float bonus = get_compensation_bonus(m->team_a[i]->lose_streak);
+        if (bonus > max_bonus) max_bonus = bonus;
+    }
+    if (max_bonus > 0.0f) {
+        win_prob_a = clampf(win_prob_a * (1.0f + max_bonus), 0.05f, 0.95f);
+    }
 
     m->winner = (randf() < win_prob_a) ? 0 : 1;
     return m->winner;
