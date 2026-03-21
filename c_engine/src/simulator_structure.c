@@ -3,7 +3,30 @@
  *
  * Simulateur EOMM (prototype) - pool 300 joueurs, parties uniquement 5v5.
  *
- * Objectifs de simulation:
+ * =========================================================================
+ * OBJECTIF EOMM (Engagement-Optimized Matchmaking)
+ * =========================================================================
+ * L'objectif n'est PAS de créer des matchs parfaitement équilibrés, mais de
+ * MAXIMISER L'ENGAGEMENT en contrôlant les cycles de winning/losing streaks.
+ *
+ * Le système:
+ * - Vise ~50% de winrate global pour tous les joueurs sur le long terme
+ * - Manipule la COMPOSITION d'équipes (pas les gains/pertes de LP)
+ * - Crée des cycles naturels: périodes de victoires suivies de défaites forcées
+ * - Montre que même les meilleurs joueurs ne peuvent échapper aux streaks
+ * - Montre que même les mauvais joueurs ont des "moments de gloire"
+ *
+ * Winrates cibles:
+ * - Excellents joueurs: ~58-62% (meilleur, mais pas dominant)
+ * - Mauvais joueurs:    ~40-45% (pire, mais pas inexistant)
+ * - Tout le monde subit des cycles avec streaks qui varient naturellement
+ *
+ * IMPORTANT: Pas de récompense pour la performance individuelle (LoL standard).
+ *            LP gains/losses sont fixes (+25/-25). Le biais vient uniquement
+ *            de la composition d'équipes.
+ * =========================================================================
+ *
+ * Objectifs techniques de simulation:
  * - Tous les joueurs commencent au même MMR visible (ex: 1500)
  * - Game 1: matchmaking totalement random (tout le monde est "inconnu")
  * - Games 1..10: phase de placement (MMR delta x2)
@@ -15,6 +38,7 @@
  *
  * Hidden factor:
  * - pénalise si rôle/champion actuel hors top observé (seulement quand top connu)
+ * - pénalise si champion hors pool de rôle du joueur (wrong role pick)
  * - pénalise pings/chat/deaths/clickrate via historiques
  *   (chat via baseline EMA)
  */
@@ -56,6 +80,7 @@
 /* Penalités hidden factor */
 #define PENALTY_ROLE_NOT_TOP2          0.10f
 #define PENALTY_CHAMP_NOT_TOP3         0.20f
+#define PENALTY_CHAMP_WRONG_ROLE       0.25f  /* pick hors pool de rôle du joueur */
 #define PENALTY_INGAME_PINGS_ABOVE_AVG 0.05f
 #define PENALTY_CHAT_ABOVE_BASELINE    0.05f
 #define PENALTY_DEATH_ABOVE_AVG        0.05f
@@ -72,11 +97,31 @@
 #define PENALTY_TROLL_PICK      0.20f  /* -20% hidden factor for troll pick */
 #define TROLL_PICK_TILT_INCREASE 5     /* tilt increase when troll-pick detected */
 
-/* Reset */
+/* Champion pool pick percentages */
+#define POOL_NORMAL_PICK_PERCENT 90    /* ~90%: pick from role-compatible pool */
+                                       /* ~10%: trollpick off-pool when tilt   */
+
+/* =========================================================================
+ * Reset du Hidden MMR - Dual Mode (7 et 14 parties)
+ * =========================================================================
+ * Le reset est TOTAL (pas graduel): hidden_mmr_state revient à HMR_NEUTRAL,
+ * loseStreak et tilt_level sont remis à zéro.
+ *
+ * Deux modes testables:
+ *   RESET_SHORT  = 7  parties: cycle court, redemption rapide
+ *   RESET_MEDIUM = 14 parties: cycle moyen, streaks dramatiques réalistes
+ *                              (correspond aux données observées, ex: 12 pertes
+ *                               consécutives sur un smurf Riven)
+ *
+ * CURRENT_RESET_MODE est le mode actif; changer sa valeur pour comparer les
+ * deux simulations. Dans main(), une boucle exécute les deux modes.
+ * ========================================================================= */
+#define RESET_SHORT              7
+#define RESET_MEDIUM             14
+#define CURRENT_RESET_MODE       RESET_MEDIUM
+
+/* Full (time-based) reset after 7 days of inactivity */
 #define FULL_RESET_SECONDS (7 * 24 * 3600)
-#define SOFT_RESET_PERIOD_GAMES 8
-#define SOFT_RESET_HIDDEN_W 0.95f
-#define SOFT_RESET_VISIBLE_W 0.05f
 
 /* Baseline chat EMA */
 #define CHAT_BASELINE_EMA_ALPHA 0.10f
@@ -293,15 +338,30 @@ static void pushHistory(Player *p, int ingamePingCount, int chatUsage, int death
 static void resetHiddenMMR(Player *p) {
     time_t now = time(NULL);
     if (p->lastMatchTime == 0) { p->lastMatchTime = now; return; }
-    if (difftime(now, p->lastMatchTime) >= (double)FULL_RESET_SECONDS) {
+    if (difftime(now, p->lastMatchTime) >= (double)(FULL_RESET_SECONDS)) {
         p->hiddenMMR = p->neutralMMR;
         p->lastMatchTime = now;
     }
 }
 
+/*
+ * softResetHiddenMMR - Reset TOTAL du hidden MMR après CURRENT_RESET_MODE parties.
+ *
+ * Ce reset est intentionnellement brutal (pas graduel): le joueur revient
+ * à HMR_NEUTRAL quel que soit son état précédent, ce qui brise les cycles
+ * de losing streak et crée les "moments de gloire" même pour les mauvais
+ * joueurs, ou à l'inverse force les bons joueurs dans une phase de recalibre.
+ *
+ * loseStreak et tilt_level sont aussi réinitialisés pour éviter l'effet
+ * boule de neige indéfini.
+ */
 static void softResetHiddenMMR(Player *p) {
-    if ((p->totalGames % SOFT_RESET_PERIOD_GAMES) == 0 && p->totalGames > 0) {
-        p->hiddenMMR = SOFT_RESET_HIDDEN_W * p->hiddenMMR + SOFT_RESET_VISIBLE_W * p->visibleMMR;
+    if (p->totalGames > 0 && (p->totalGames % CURRENT_RESET_MODE) == 0) {
+        p->hidden_mmr_state = HMR_NEUTRAL;
+        p->loseStreak       = 0;
+        p->tilt_level       = 0;
+        printf("[RESET] %s at game %d (mode=%d)\n",
+               p->name, p->totalGames, CURRENT_RESET_MODE);
     }
 }
 
@@ -436,6 +496,18 @@ static float calculateHiddenFactor(Player *p) {
         factor -= PENALTY_TROLL_PICK;
     }
 
+    /* Wrong-role pick penalty: champion outside player's role pool */
+    if (p->currentChampionId >= 1 && p->currentChampionId <= LOL_CHAMP_COUNT) {
+        const LolChampion *champ = &LOL_CHAMPIONS[p->currentChampionId];
+        int champRole0 = champ->primary_role;
+        int champRole1 = champ->secondary_role;
+        int roleOK = (champRole0 == p->primaryRole   ||
+                      champRole0 == p->secondaryRole  ||
+                      champRole1 == p->primaryRole    ||
+                      champRole1 == p->secondaryRole);
+        if (!roleOK) factor -= PENALTY_CHAMP_WRONG_ROLE;
+    }
+
     if (factor < HIDDEN_FACTOR_MIN) factor = HIDDEN_FACTOR_MIN;
     return factor;
 }
@@ -445,8 +517,80 @@ static float effectiveMMR(Player *p) {
 }
 
 /* =========================
- * Troll-pick / Champion selection
+ * Champion Pool System
  * ========================= */
+
+/*
+ * buildPlayerChampionPool - Build the list of champion IDs that are viable
+ * for this player based on role compatibility.
+ *
+ * A champion is IN the pool if its primary_role OR secondary_role matches the
+ * player's primaryRole OR secondaryRole.  Any other champion is considered an
+ * off-pool (wrong-role) pick and can be treated as a trollpick.
+ *
+ * Returns the number of champions placed in poolIds[].
+ * poolIds must have room for at least LOL_CHAMP_COUNT entries.
+ */
+static int buildPlayerChampionPool(const Player *p, int *poolIds, int maxPool) {
+    int count = 0;
+    for (int c = 1; c <= LOL_CHAMP_COUNT && count < maxPool; c++) {
+        const LolChampion *champ = &LOL_CHAMPIONS[c];
+        if (champ->primary_role  == p->primaryRole   ||
+            champ->primary_role  == p->secondaryRole  ||
+            champ->secondary_role == p->primaryRole   ||
+            champ->secondary_role == p->secondaryRole) {
+            poolIds[count++] = c;
+        }
+    }
+    return count;
+}
+
+/*
+ * selectChampionWithPool - Pick a champion using the role-based pool.
+ *
+ * POOL_NORMAL_PICK_PERCENT % of the time the player picks a role-compatible
+ * champion (normal play).  The remaining (100 - POOL_NORMAL_PICK_PERCENT) %
+ * the player trollpicks outside the pool (wrong role), simulating tilt.
+ * The actual troll probability is still modulated by calculateTrollProbability()
+ * so it scales naturally with loseStreak.
+ *
+ * Sets p->currentChampionId and p->isTrollPick.
+ */
+static void selectChampionWithPool(Player *p) {
+    int poolIds[LOL_CHAMP_COUNT];
+    int poolCount = buildPlayerChampionPool(p, poolIds, LOL_CHAMP_COUNT);
+
+    /* Use the scaled troll probability (5% base + 2% per loseStreak) */
+    float troll_prob = calculateTrollProbability(p);
+    p->trollProbability = troll_prob;
+
+    int troll_roll = rand_range(1, 100);
+    if ((float)troll_roll <= troll_prob) {
+        /* TROLLPICK: pick a champion OUTSIDE the role pool */
+        int tries = 0;
+        int c = rand_range(1, CHAMP_POOL);
+        while (tries < 20 && poolCount > 0) {
+            int inPool = 0;
+            for (int i = 0; i < poolCount; i++) {
+                if (poolIds[i] == c) { inPool = 1; break; }
+            }
+            if (!inPool) break;
+            c = rand_range(1, CHAMP_POOL);
+            tries++;
+        }
+        p->currentChampionId = c;
+        p->isTrollPick = 1;
+    } else {
+        /* NORMAL PICK: choose from role-compatible pool */
+        if (poolCount > 0) {
+            p->currentChampionId = poolIds[rand_range(0, poolCount - 1)];
+        } else {
+            /* Fallback if no pool built (should not happen with 170 champions) */
+            p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
+        }
+        p->isTrollPick = 0;
+    }
+}
 
 /*
  * calculateTrollProbability - return the current troll-pick probability (%).
@@ -459,52 +603,14 @@ static float calculateTrollProbability(Player *p) {
 }
 
 /*
- * pickChampion - select a champion for this game using troll-probability logic.
+ * pickChampion - select a champion for this game.
  *
- * Normal pick  : choose from established mainChampionPool (topChampions).
- * Troll pick   : choose any champion from the full pool at random.
+ * Delegates to selectChampionWithPool() which uses the role-based champion
+ * pool (~90% normal, ~10% trollpick off-pool scaling with loseStreak).
  * The isTrollPick flag is set and picked up later by calculateHiddenFactor().
  */
 static void pickChampion(Player *p) {
-    float troll_prob = calculateTrollProbability(p);
-    p->trollProbability = troll_prob;
-
-    int troll_roll = rand_range(1, 100);
-    if ((float)troll_roll <= troll_prob) {
-        /* TROLL PICK: random champion outside the main pool */
-        int c;
-        int tries = 0;
-        do {
-            c = rand_range(1, CHAMP_POOL);
-            tries++;
-            /* If no established pool yet, any pick is fine */
-            if (p->topChampionsCount == 0) break;
-            /* Try to pick a champion NOT in the main pool */
-            int inPool = 0;
-            int i;
-            for (i = 0; i < p->topChampionsCount; i++) {
-                if (champIdFromName(p->topChampions[i]) == c) { inPool = 1; break; }
-            }
-            if (!inPool) break;
-        } while (tries < 10);
-
-        p->currentChampionId = c;
-        p->isTrollPick = 1;
-    } else {
-        /* NORMAL PICK: choose from main champion pool */
-        if (p->topChampionsCount > 0) {
-            int idx = rand_range(0, p->topChampionsCount - 1);
-            p->currentChampionId = champIdFromName(p->topChampions[idx]);
-            if (p->currentChampionId == 0) {
-                /* Fallback if name lookup fails */
-                p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
-            }
-        } else {
-            /* No established pool yet: pick from latent preferences */
-            p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
-        }
-        p->isTrollPick = 0;
-    }
+    selectChampionWithPool(p);
 
     /* Sync string name used by the rest of the simulation */
     champNameFromId(p->currentChampionId, p->currentChampion);
@@ -553,11 +659,10 @@ static void assignRole(Player *p, int availableRoles[5]) {
  * calculateHiddenMMRState - Determine a player's hidden MMR category.
  * Also updates p->tilt_level (0=none, 1=light, 2=heavy).
  *
- * Rules:
- *   - loseStreak >= 3 OR factor <= 0.70  => heavy tilt  => NEGATIVE
- *   - loseStreak >  0 OR factor <  0.90  => light tilt  => NEGATIVE
- *   - factor >= 0.95 and loseStreak == 0 => POSITIVE
- *   - otherwise                          => NEUTRAL
+ * Categorisation claire:
+ *   HMR_NEGATIVE: tilt heavy (loseStreak >= 3 OR factor <= 0.70)
+ *   HMR_NEUTRAL:  normal     (0.70 < factor < 0.95)
+ *   HMR_POSITIVE: excellent  (factor >= 0.95 AND loseStreak == 0)
  */
 static HiddenMMRState calculateHiddenMMRState(Player *p) {
     float factor = calculateHiddenFactor(p);
@@ -566,12 +671,12 @@ static HiddenMMRState calculateHiddenMMRState(Player *p) {
         p->tilt_level = 2;
         return HMR_NEGATIVE;
     }
-    if (p->loseStreak > 0 || factor < 0.90f) {
-        p->tilt_level = 1;
-        return HMR_NEGATIVE;
+    if (factor >= 0.95f && p->loseStreak == 0) {
+        p->tilt_level = 0;
+        return HMR_POSITIVE;
     }
-    p->tilt_level = 0;
-    return (factor >= 0.95f) ? HMR_POSITIVE : HMR_NEUTRAL;
+    p->tilt_level = (p->loseStreak > 0) ? 1 : 0;
+    return HMR_NEUTRAL;
 }
 
 /*
@@ -594,14 +699,33 @@ static int selectTiltPlayers(Player **pool, int poolSize, Player **out, int maxO
 /*
  * selectHealthyPlayers - Fill `out` with up to `maxOut` players that have
  * neutral or positive hidden MMR from `pool`.
+ *
+ * 80% of slots are guaranteed HMR_NEUTRAL/POSITIVE to ensure the winning team
+ * has genuinely healthy players.  The last slot (~20% of the time, or ~30%
+ * overall chance for a team of 3) may include a HMR_NEGATIVE player chosen
+ * at random, simulating the natural variance where even the "good" team
+ * occasionally has a weak link.
  */
 static int selectHealthyPlayers(Player **pool, int poolSize, Player **out, int maxOut) {
     int count = 0;
+
+    /* Guaranteed healthy picks */
     for (int i = 0; i < poolSize && count < maxOut; i++) {
         if (pool[i]->hidden_mmr_state != HMR_NEGATIVE) {
             out[count++] = pool[i];
         }
     }
+
+    /* ~30% chance to include 1 negative player (random variance in "good" team) */
+    if (count < maxOut && (rand_range(1, 100) <= 30)) {
+        for (int i = 0; i < poolSize && count < maxOut; i++) {
+            if (pool[i]->hidden_mmr_state == HMR_NEGATIVE) {
+                out[count++] = pool[i];
+                break; /* at most 1 negative per healthy team */
+            }
+        }
+    }
+
     return count;
 }
 
@@ -1055,20 +1179,22 @@ static void initPlayer(Player *p, int idx) {
  * Main (optionnel)
  * ========================= */
 #ifdef BUILD_SIMULATOR_MAIN
-int main(void) {
-    srand((unsigned int)time(NULL));
 
-    Player players[N_PLAYERS];
-    for (int i = 0; i < N_PLAYERS; i++) initPlayer(&players[i], i);
+/*
+ * runSimulation - exécute une simulation complète de NUM_GAMES tours pour
+ * un pool de N_PLAYERS joueurs avec le resetMode donné.
+ * Réinitialise tous les joueurs avant chaque run pour des comparaisons justes.
+ */
+static void runSimulation(Player *players, int nPlayers, int resetMode, int numGames) {
+    /* Re-init all players for a clean run */
+    for (int i = 0; i < nPlayers; i++) initPlayer(&players[i], i);
 
-    /* Randomly select N_SMURFS distinct players to be smurfs
-     * (N_SMURFS / N_PLAYERS = 10% of playerbase).
-     * Uses a partial Fisher-Yates shuffle on an index array to avoid bias. */
+    /* Randomly select N_SMURFS distinct players to be smurfs (~10% of pool) */
     {
         int idx[N_PLAYERS];
-        for (int i = 0; i < N_PLAYERS; i++) idx[i] = i;
+        for (int i = 0; i < nPlayers; i++) idx[i] = i;
         for (int i = 0; i < N_SMURFS; i++) {
-            int j = i + rand() % (N_PLAYERS - i);
+            int j = i + rand() % (nPlayers - i);
             int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
             players[idx[i]].is_smurf = 1;
         }
@@ -1077,36 +1203,52 @@ int main(void) {
     Match matches[N_PLAYERS / MATCH_SIZE];
     int numMatches = 0;
 
-    int NUM_GAMES = 50;
+    printf("\n=== SIMULATION RESET MODE %d parties ===\n", resetMode);
 
-    for (int g = 0; g < NUM_GAMES; g++) {
-        for (int i = 0; i < N_PLAYERS; i++) resetHiddenMMR(&players[i]);
+    for (int g = 0; g < numGames; g++) {
+        for (int i = 0; i < nPlayers; i++) resetHiddenMMR(&players[i]);
 
-        /* Game 1 random, then advanced placement */
-        if (g == 0) placeInitialTeams(players, N_PLAYERS, matches, &numMatches);
-        else createMatchAdvanced(players, N_PLAYERS, matches, &numMatches);
+        /* Game 1 random, then EOMM-biased matchmaking */
+        if (g == 0) placeInitialTeams(players, nPlayers, matches, &numMatches);
+        else        createMatchAdvanced(players, nPlayers, matches, &numMatches);
 
         simulateMatchAndUpdatePlayers(matches, numMatches);
     }
 
-    printf("Simulation finished. Sample players:\n");
+    printf("Simulation finished (mode=%d). Sample players:\n", resetMode);
     for (int i = 0; i < 10; i++) {
         Player *p = &players[i];
-        printf("%s mmr=%.0f factor=%.2f chatBaseline=%.2f loseStreak=%d W=%d L=%d G=%d "
-               "topRolesCount=%d topChampsCount=%d smurf=%d tilt=%d\n",
-               p->name, p->visibleMMR, calculateHiddenFactor(p), p->chatBaselineAvg, p->loseStreak,
-               p->wins, p->losses, p->totalGames, p->topRolesCount, p->topChampionsCount,
-               p->is_smurf, p->tilt_level);
+        printf("  %s mmr=%.0f factor=%.2f loseStreak=%d W=%d L=%d G=%d smurf=%d tilt=%d\n",
+               p->name, p->visibleMMR, calculateHiddenFactor(p), p->loseStreak,
+               p->wins, p->losses, p->totalGames, p->is_smurf, p->tilt_level);
     }
 
     /* EOMM smurf winrate summary */
-    printf("\nSmurf winrate summary (%d smurfs):\n", N_SMURFS);
-    for (int i = 0; i < N_PLAYERS; i++) {
+    printf("\nSmurf winrate summary (%d smurfs, mode=%d):\n", N_SMURFS, resetMode);
+    for (int i = 0; i < nPlayers; i++) {
         Player *p = &players[i];
         if (!p->is_smurf) continue;
         float wr = (p->totalGames > 0) ? (100.0f * (float)p->wins / (float)p->totalGames) : 0.0f;
         printf("  %s mmr=%.0f W=%d L=%d G=%d winrate=%.1f%%\n",
                p->name, p->visibleMMR, p->wins, p->losses, p->totalGames, wr);
+    }
+}
+
+int main(void) {
+    srand((unsigned int)time(NULL));
+
+    Player players[N_PLAYERS];
+    int NUM_GAMES = 50;
+
+    /* Dual-mode comparison: RESET_SHORT (7) vs RESET_MEDIUM (14)
+     * Allows observing how the reset cycle length affects streak patterns.
+     * RESET_SHORT  = 7:  shorter cycles, quicker redemption
+     * RESET_MEDIUM = 14: longer cycles, more dramatic streaks (matches real data) */
+    int resetModes[] = { RESET_SHORT, RESET_MEDIUM };
+    int numModes = (int)(sizeof(resetModes) / sizeof(resetModes[0]));
+
+    for (int m = 0; m < numModes; m++) {
+        runSimulation(players, N_PLAYERS, resetModes[m], NUM_GAMES);
     }
 
     return 0;
