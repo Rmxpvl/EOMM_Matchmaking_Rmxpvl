@@ -21,8 +21,13 @@ TEST_AUTOFILL_TARGET = $(BIN_DIR)/test_autofill_system
 TEST_AUTOFILL_SRCS   = $(SRC_DIR)/eomm_system.c tests/test_autofill_system.c
 TEST_AUTOFILL_INCLUDE = -I$(INC_DIR)
 
+# ── Autofill debug test target ────────────────────────────
+TEST_DEBUG_TARGET  = $(BIN_DIR)/test_debug_autofill
+TEST_DEBUG_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_debug_autofill.c
+TEST_DEBUG_INCLUDE = -I$(INC_DIR)
+
 # ── Default target ────────────────────────────────────────
-.PHONY: all build eomm clean run test test_autofill
+.PHONY: all build eomm clean run test test_autofill test_debug_autofill
 
 all: eomm
 
@@ -51,6 +56,12 @@ test_autofill: $(BIN_DIR) $(TEST_AUTOFILL_TARGET)
 $(TEST_AUTOFILL_TARGET): $(TEST_AUTOFILL_SRCS) $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(TEST_AUTOFILL_INCLUDE) -o $@ $(TEST_AUTOFILL_SRCS)
 
+# Build autofill debug test
+test_debug_autofill: $(BIN_DIR) $(TEST_DEBUG_TARGET)
+
+$(TEST_DEBUG_TARGET): $(TEST_DEBUG_SRCS) $(INC_DIR)/eomm_system.h
+	$(CC) $(CFLAGS) $(TEST_DEBUG_INCLUDE) -o $@ $(TEST_DEBUG_SRCS)
+
 # Run EOMM system (interactive)
 run: eomm
 	$(EOMM_TARGET)
@@ -59,10 +70,14 @@ run: eomm
 build: eomm
 
 # Test target
-test: test_autofill
+test: test_autofill test_debug_autofill
 	@echo "Running autofill test suite..."
 	$(TEST_AUTOFILL_TARGET)
 	@echo "Test suite complete."
+	@echo ""
+	@echo "Running autofill debug test..."
+	$(TEST_DEBUG_TARGET)
+	@echo "Debug test complete."
 
 # Clean
 clean:
