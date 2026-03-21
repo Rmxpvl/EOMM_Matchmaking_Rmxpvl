@@ -56,6 +56,7 @@
 /* Penalités hidden factor */
 #define PENALTY_ROLE_NOT_TOP2          0.10f
 #define PENALTY_CHAMP_NOT_TOP3         0.20f
+#define PENALTY_CHAMP_WRONG_ROLE       0.25f  /* -25% if champion's role doesn't match player's top roles */
 #define PENALTY_INGAME_PINGS_ABOVE_AVG 0.05f
 #define PENALTY_CHAT_ABOVE_BASELINE    0.05f
 #define PENALTY_DEATH_ABOVE_AVG        0.05f
@@ -72,11 +73,11 @@
 #define PENALTY_TROLL_PICK      0.20f  /* -20% hidden factor for troll pick */
 #define TROLL_PICK_TILT_INCREASE 5     /* tilt increase when troll-pick detected */
 
-/* Reset */
-#define FULL_RESET_SECONDS (7 * 24 * 3600)
-#define SOFT_RESET_PERIOD_GAMES 8
-#define SOFT_RESET_HIDDEN_W 0.95f
-#define SOFT_RESET_VISIBLE_W 0.05f
+/* Reset dual: RESET_SHORT (7 games) or RESET_MEDIUM (14 games) - TOTAL reset */
+#define RESET_SHORT  7
+#define RESET_MEDIUM 14
+/* Change CURRENT_RESET_MODE to switch between the two reset modes */
+#define CURRENT_RESET_MODE RESET_MEDIUM
 
 /* Baseline chat EMA */
 #define CHAT_BASELINE_EMA_ALPHA 0.10f
@@ -140,6 +141,7 @@ typedef struct {
 
     /* Tilt state */
     int loseStreak;
+    int winStreak;
 
     /* EOMM fields */
     int            is_smurf;         /* 1 if this player is a smurf, 0 otherwise  */
@@ -293,15 +295,26 @@ static void pushHistory(Player *p, int ingamePingCount, int chatUsage, int death
 static void resetHiddenMMR(Player *p) {
     time_t now = time(NULL);
     if (p->lastMatchTime == 0) { p->lastMatchTime = now; return; }
-    if (difftime(now, p->lastMatchTime) >= (double)FULL_RESET_SECONDS) {
+    if (difftime(now, p->lastMatchTime) >= (double)(7 * 24 * 3600)) {
         p->hiddenMMR = p->neutralMMR;
         p->lastMatchTime = now;
     }
 }
 
+/*
+ * softResetHiddenMMR - TOTAL reset of hidden MMR after CURRENT_RESET_MODE games.
+ * Two modes available: RESET_SHORT (7) or RESET_MEDIUM (14).
+ * TOTAL reset: returns to neutral state (not progressive 95%/5%).
+ * Also resets loseStreak and tilt_level.
+ */
 static void softResetHiddenMMR(Player *p) {
-    if ((p->totalGames % SOFT_RESET_PERIOD_GAMES) == 0 && p->totalGames > 0) {
-        p->hiddenMMR = SOFT_RESET_HIDDEN_W * p->hiddenMMR + SOFT_RESET_VISIBLE_W * p->visibleMMR;
+    if ((p->totalGames % CURRENT_RESET_MODE) == 0 && p->totalGames > 0) {
+        /* TOTAL reset: full return to neutral state (hidden factor = 1.0) */
+        p->hidden_mmr_state = HMR_NEUTRAL;
+        p->loseStreak = 0;
+        p->tilt_level = 0;
+        printf("[RESET] %s total reset at game %d (mode=%d)\n",
+               p->name, p->totalGames, CURRENT_RESET_MODE);
     }
 }
 
@@ -436,6 +449,16 @@ static float calculateHiddenFactor(Player *p) {
         factor -= PENALTY_TROLL_PICK;
     }
 
+    /* Champion wrong-role penalty: champion's primary role doesn't match player's top roles */
+    if (p->topRolesCount >= 1) {
+        int roleMatch = 0;
+        for (int i = 0; i < p->topRolesCount; i++) {
+            /* topRoles are 1-indexed; currentChampionRole is 0-indexed */
+            if (p->currentChampionRole == (p->topRoles[i] - 1)) { roleMatch = 1; break; }
+        }
+        if (!roleMatch) factor -= PENALTY_CHAMP_WRONG_ROLE;
+    }
+
     if (factor < HIDDEN_FACTOR_MIN) factor = HIDDEN_FACTOR_MIN;
     return factor;
 }
@@ -459,31 +482,53 @@ static float calculateTrollProbability(Player *p) {
 }
 
 /*
- * pickChampion - select a champion for this game using troll-probability logic.
- *
- * Normal pick  : choose from established mainChampionPool (topChampions).
- * Troll pick   : choose any champion from the full pool at random.
- * The isTrollPick flag is set and picked up later by calculateHiddenFactor().
+ * buildPlayerChampionPool - Build a pool of viable champions based on observed roles.
+ * Filters champions whose primary role matches the player's topRoles.
+ * Returns the number of champions in outPool.
  */
-static void pickChampion(Player *p) {
+static int buildPlayerChampionPool(const Player *p, int outPool[], int maxPool) {
+    int count = 0;
+    if (p->topRolesCount == 0) return 0;  /* No roles observed yet */
+
+    for (int c = 1; c <= CHAMP_POOL && count < maxPool; c++) {
+        int champRole = lolChampPrimaryRole(c);
+        for (int r = 0; r < p->topRolesCount; r++) {
+            /* topRoles are 1-indexed; champRole is 0-indexed */
+            if (champRole == (p->topRoles[r] - 1)) {
+                outPool[count++] = c;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+/*
+ * selectChampionWithPool - Pick a champion from the role pool (or troll outside it).
+ * Uses buildPlayerChampionPool() to build a pool of viable champions based on the
+ * player's top observed roles, then applies troll probability to decide if the
+ * player steps outside the pool (tilt behaviour).
+ */
+static void selectChampionWithPool(Player *p) {
     float troll_prob = calculateTrollProbability(p);
     p->trollProbability = troll_prob;
 
+    int rolePool[CHAMP_POOL];
+    int rolePoolN = buildPlayerChampionPool(p, rolePool, CHAMP_POOL);
+
     int troll_roll = rand_range(1, 100);
-    if ((float)troll_roll <= troll_prob) {
-        /* TROLL PICK: random champion outside the main pool */
+    if ((float)troll_roll <= troll_prob || rolePoolN == 0) {
+        /* TROLL PICK: champion outside role pool */
         int c;
         int tries = 0;
         do {
             c = rand_range(1, CHAMP_POOL);
             tries++;
-            /* If no established pool yet, any pick is fine */
-            if (p->topChampionsCount == 0) break;
-            /* Try to pick a champion NOT in the main pool */
+            if (rolePoolN == 0) break;
+            /* Try to pick a champion NOT in the role pool */
             int inPool = 0;
-            int i;
-            for (i = 0; i < p->topChampionsCount; i++) {
-                if (champIdFromName(p->topChampions[i]) == c) { inPool = 1; break; }
+            for (int i = 0; i < rolePoolN; i++) {
+                if (rolePool[i] == c) { inPool = 1; break; }
             }
             if (!inPool) break;
         } while (tries < 10);
@@ -491,25 +536,14 @@ static void pickChampion(Player *p) {
         p->currentChampionId = c;
         p->isTrollPick = 1;
     } else {
-        /* NORMAL PICK: choose from main champion pool */
-        if (p->topChampionsCount > 0) {
-            int idx = rand_range(0, p->topChampionsCount - 1);
-            p->currentChampionId = champIdFromName(p->topChampions[idx]);
-            if (p->currentChampionId == 0) {
-                /* Fallback if name lookup fails */
-                p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
-            }
-        } else {
-            /* No established pool yet: pick from latent preferences */
-            p->currentChampionId = p->prefChampIds[rand_range(0, 2)];
-        }
+        /* NORMAL PICK: champion from role pool */
+        int idx = rand_range(0, rolePoolN - 1);
+        p->currentChampionId = rolePool[idx];
         p->isTrollPick = 0;
     }
 
-    /* Sync string name used by the rest of the simulation */
+    /* Sync string name and champion role */
     champNameFromId(p->currentChampionId, p->currentChampion);
-
-    /* Set champion role (0-indexed) for this game */
     p->currentChampionRole = lolChampPrimaryRole(p->currentChampionId);
 }
 
@@ -592,16 +626,40 @@ static int selectTiltPlayers(Player **pool, int poolSize, Player **out, int maxO
 }
 
 /*
- * selectHealthyPlayers - Fill `out` with up to `maxOut` players that have
- * neutral or positive hidden MMR from `pool`.
+ * selectHealthyPlayers - Select players for the winning team (teamB).
+ * Composition with randomness: 70% chance of a "healthy" player (non-NEGATIVE),
+ * 30% chance of a random player (may be NEGATIVE, for realism).
+ * Guarantees a minimum of 2 healthy players in the final selection.
+ *
+ * healthyPool/healthyN : non-NEGATIVE players available (already shuffled)
+ * anyPool/anyN         : other players (e.g. remaining tilt) for the 30% slot
  */
-static int selectHealthyPlayers(Player **pool, int poolSize, Player **out, int maxOut) {
+static int selectHealthyPlayers(Player **healthyPool, int healthyN,
+                                  Player **anyPool, int anyN,
+                                  Player **out, int maxOut) {
     int count = 0;
-    for (int i = 0; i < poolSize && count < maxOut; i++) {
-        if (pool[i]->hidden_mmr_state != HMR_NEGATIVE) {
-            out[count++] = pool[i];
+    int healthyCount = 0;
+    int hIdx = 0;
+    int aIdx = 0;
+
+    for (int slot = 0; slot < maxOut; slot++) {
+        /* Force a healthy player if the minimum of 2 has not yet been reached */
+        int forceHealthy = (healthyCount < 2);
+        int useRandom = (!forceHealthy && aIdx < anyN && rand_range(1, 100) <= 30);
+
+        if (useRandom) {
+            /* 30%: random player (may be NEGATIVE) */
+            out[count++] = anyPool[aIdx++];
+        } else if (hIdx < healthyN) {
+            /* 70%: healthy player (non-NEGATIVE) */
+            out[count++] = healthyPool[hIdx++];
+            healthyCount++;
+        } else if (aIdx < anyN) {
+            /* No more healthy players available, fall back to any */
+            out[count++] = anyPool[aIdx++];
         }
     }
+
     return count;
 }
 
@@ -670,10 +728,11 @@ static void createMatchWithEOMM(Player *players, int nPlayers, Match *matches, i
     Player **smurfPool  = (Player**)malloc(sizeof(Player*) * nPlayers);
     Player **tiltPool   = (Player**)malloc(sizeof(Player*) * nPlayers);
     Player **healthyPool = (Player**)malloc(sizeof(Player*) * nPlayers);
+    Player **anyPool    = (Player**)malloc(sizeof(Player*) * nPlayers);
     Player **remaining  = (Player**)malloc(sizeof(Player*) * nPlayers);
 
-    if (!smurfPool || !tiltPool || !healthyPool || !remaining) {
-        free(smurfPool); free(tiltPool); free(healthyPool); free(remaining);
+    if (!smurfPool || !tiltPool || !healthyPool || !anyPool || !remaining) {
+        free(smurfPool); free(tiltPool); free(healthyPool); free(anyPool); free(remaining);
         free(assigned);
         return;
     }
@@ -747,8 +806,24 @@ static void createMatchWithEOMM(Player *players, int nPlayers, Match *matches, i
         }
 
         /* ---- Fill winning team (teamB) with healthy players ---- */
+        /*
+         * 70/30 composition: 70% healthy players (non-NEGATIVE), 30% random player.
+         * Guarantees minimum 2 healthy players. anyPool contains remaining unassigned
+         * tilt players for the 30% random slot (non-smurf players outside healthyPool).
+         */
+        int anyN = 0;
+        for (int i = 0; i < nPlayers; i++) {
+            if (!assigned[i] && !players[i].is_smurf &&
+                players[i].hidden_mmr_state == HMR_NEGATIVE) {
+                anyPool[anyN++] = &players[i];
+            }
+        }
+        shufflePlayerPtrs(anyPool, anyN);
+
         Player *healthySelected[HEALTHY_TEAM_MIN];
-        int healthySelectedN = selectHealthyPlayers(healthyPool, healthyN, healthySelected, HEALTHY_TEAM_MIN);
+        int healthySelectedN = selectHealthyPlayers(healthyPool, healthyN,
+                                                     anyPool, anyN,
+                                                     healthySelected, HEALTHY_TEAM_MIN);
 
         for (int h = 0; h < healthySelectedN; h++) {
             match->teamB[bCount++] = healthySelected[h];
@@ -787,6 +862,7 @@ static void createMatchWithEOMM(Player *players, int nPlayers, Match *matches, i
     free(smurfPool);
     free(tiltPool);
     free(healthyPool);
+    free(anyPool);
     free(remaining);
     free(assigned);
 }
@@ -931,9 +1007,9 @@ static void simulateMatchAndUpdatePlayers(Match *matches, int numMatches) {
             assignRole(pa, availableRolesA);
             assignRole(pb, availableRolesB);
 
-            /* Champion selection with troll-pick logic */
-            pickChampion(pa);
-            pickChampion(pb);
+            /* Champion selection with role-pool logic (replaces pickChampion) */
+            selectChampionWithPool(pa);
+            selectChampionWithPool(pb);
 
             /* Observe picks for inferred tops */
             observePick(pa);
@@ -958,9 +1034,29 @@ static void simulateMatchAndUpdatePlayers(Match *matches, int numMatches) {
             if (aWon) { pa->wins++; pb->losses++; }
             else { pb->wins++; pa->losses++; }
 
-            /* loseStreak update */
-            if (aWon) pa->loseStreak = 0; else pa->loseStreak += 1;
-            if (bWon) pb->loseStreak = 0; else pb->loseStreak += 1;
+            /* loseStreak / winStreak update with streak logging */
+            if (aWon) {
+                pa->loseStreak = 0;
+                pa->winStreak++;
+                if (pa->winStreak >= 3)
+                    printf("[STREAK] %s winning streak: %d\n", pa->name, pa->winStreak);
+            } else {
+                pa->loseStreak++;
+                pa->winStreak = 0;
+                if (pa->loseStreak >= 3)
+                    printf("[STREAK] %s losing streak: %d\n", pa->name, pa->loseStreak);
+            }
+            if (bWon) {
+                pb->loseStreak = 0;
+                pb->winStreak++;
+                if (pb->winStreak >= 3)
+                    printf("[STREAK] %s winning streak: %d\n", pb->name, pb->winStreak);
+            } else {
+                pb->loseStreak++;
+                pb->winStreak = 0;
+                if (pb->loseStreak >= 3)
+                    printf("[STREAK] %s losing streak: %d\n", pb->name, pb->loseStreak);
+            }
 
             /* Troll pick tilt feedback: once per game, not per factor computation */
             if (pa->isTrollPick) pa->tilt_level += TROLL_PICK_TILT_INCREASE;
@@ -1019,6 +1115,7 @@ static void initPlayer(Player *p, int idx) {
     for (int c = 0; c <= CHAMP_POOL; c++) p->champFreq[c] = 0;
 
     p->loseStreak = 0;
+    p->winStreak  = 0;
 
     /* EOMM fields */
     p->is_smurf         = 0;
