@@ -19,6 +19,9 @@ dist/
 bin/
 obj/
 
+# Generated test output
+autofill_stats.csv
+
 # macOS system files
 .DS_Store
 

@@ -16,8 +16,13 @@ EOMM_SRCS    = $(SRC_DIR)/eomm_system.c $(SRC_DIR)/eomm_main.c
 EOMM_OBJS    = $(OBJ_DIR)/eomm_system.o $(OBJ_DIR)/eomm_main.o
 EOMM_INCLUDE = -I$(INC_DIR)
 
+# ── Autofill test suite target ────────────────────────────
+TEST_AUTOFILL_TARGET = $(BIN_DIR)/test_autofill_system
+TEST_AUTOFILL_SRCS   = $(SRC_DIR)/eomm_system.c tests/test_autofill_system.c
+TEST_AUTOFILL_INCLUDE = -I$(INC_DIR)
+
 # ── Default target ────────────────────────────────────────
-.PHONY: all build eomm clean run test
+.PHONY: all build eomm clean run test test_autofill
 
 all: eomm
 
@@ -40,6 +45,12 @@ $(BIN_DIR):
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
+# Build autofill test suite
+test_autofill: $(BIN_DIR) $(TEST_AUTOFILL_TARGET)
+
+$(TEST_AUTOFILL_TARGET): $(TEST_AUTOFILL_SRCS) $(INC_DIR)/eomm_system.h
+	$(CC) $(CFLAGS) $(TEST_AUTOFILL_INCLUDE) -o $@ $(TEST_AUTOFILL_SRCS)
+
 # Run EOMM system (interactive)
 run: eomm
 	$(EOMM_TARGET)
@@ -48,10 +59,10 @@ run: eomm
 build: eomm
 
 # Test target
-test:
-	@echo "Running EOMM build test..."
-	$(MAKE) eomm
-	@echo "Build test passed."
+test: test_autofill
+	@echo "Running autofill test suite..."
+	$(TEST_AUTOFILL_TARGET)
+	@echo "Test suite complete."
 
 # Clean
 clean:
