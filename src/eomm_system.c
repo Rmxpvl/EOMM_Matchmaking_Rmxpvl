@@ -164,6 +164,11 @@ void init_player(Player *p, int id, SkillLevel skill) {
 
     p->current_role  = p->prefRoles[0];
     p->is_autofilled = 0;
+
+    /* Engagement phase initialisation */
+    p->engagement_phase        = PHASE_NEUTRAL;
+    p->phase_progress          = 0;
+    p->target_streak           = 0;
 }
 
 /*
@@ -458,6 +463,97 @@ float calculate_actual_winrate(const Player *p) {
     return clampf(wr, 0.25f, 0.75f);
 }
 /* =========================================================
+ * Engagement phase orchestration
+ * ========================================================= */
+
+/*
+ * update_engagement_phase — orchestrate hot/cold streak phases.
+ *
+ * When a player has completed their target_streak:
+ *   70% chance → extend the phase a little longer
+ *   30% chance → transition to PHASE_NEUTRAL
+ *
+ * When PHASE_NEUTRAL:
+ *   20% → enter WIN_STREAK  (target 3-7 games)
+ *   20% → enter LOSE_STREAK (target 3-7 games)
+ *   60% → stay NEUTRAL
+ */
+void update_engagement_phase(Player *p) {
+    /* Check if current phase has reached its target */
+    if (p->engagement_phase != PHASE_NEUTRAL &&
+        p->phase_progress >= p->target_streak) {
+        if (randf() < 0.70f) {
+            /* Soft extension: stay in phase a bit longer */
+            p->target_streak += 1 + (rand() % 3);
+        } else {
+            /* Transition to neutral */
+            p->engagement_phase = PHASE_NEUTRAL;
+            p->phase_progress   = 0;
+            p->target_streak    = 0;
+        }
+    }
+
+    /* Assign a new phase if currently neutral */
+    if (p->engagement_phase == PHASE_NEUTRAL) {
+        float r = randf() * 100.0f;
+        if (r < 20.0f) {
+            p->engagement_phase = PHASE_WIN_STREAK;
+            p->target_streak    = 3 + (rand() % 5); /* 3-7 games */
+            p->phase_progress   = 0;
+        } else if (r < 40.0f) {
+            p->engagement_phase = PHASE_LOSE_STREAK;
+            p->target_streak    = 3 + (rand() % 5); /* 3-7 games */
+            p->phase_progress   = 0;
+        }
+        /* else: stay NEUTRAL (60% chance) */
+    }
+}
+
+/*
+ * apply_engagement_phase_modifiers — apply soft hidden_factor and
+ * troll/autofill probability adjustments driven by the engagement phase.
+ *
+ * WIN_STREAK  : +5% hidden_factor (soft boost, favourable conditions)
+ * LOSE_STREAK : -5% hidden_factor (soft nerf, adverse conditions)
+ *
+ * Troll and autofill probabilities are modulated inside the EOMM
+ * matchmaker via calculate_matchmaking_bias(); this function only
+ * touches the hidden_factor.
+ */
+void apply_engagement_phase_modifiers(Player *p) {
+    if (p->engagement_phase == PHASE_WIN_STREAK) {
+        p->hidden_factor *= 1.05f;
+        p->hidden_factor  = clampf(p->hidden_factor,
+                                   HIDDEN_FACTOR_MIN, HIDDEN_FACTOR_MAX);
+    } else if (p->engagement_phase == PHASE_LOSE_STREAK) {
+        p->hidden_factor *= 0.95f;
+        p->hidden_factor  = clampf(p->hidden_factor,
+                                   HIDDEN_FACTOR_MIN, HIDDEN_FACTOR_MAX);
+    }
+}
+
+/*
+ * calculate_matchmaking_bias — return a soft bias score for sorting
+ * players into teams.  A higher value means the player is preferred
+ * for the losing side (team_a); a lower value for the winning side.
+ *
+ * Base score = MMR distance from pool average.
+ * LOSE_STREAK players get a +50 adjustment (favour losing side / team_a).
+ * WIN_STREAK  players get a -50 adjustment (favour winning side / team_b).
+ */
+static float calculate_matchmaking_bias(const Player *p, float mmr_distance) {
+    float bias = mmr_distance;
+
+    if (p->engagement_phase == PHASE_WIN_STREAK) {
+        bias -= 50.0f;  /* favour team_b (winning side) */
+    } else if (p->engagement_phase == PHASE_LOSE_STREAK) {
+        bias += 50.0f;  /* favour team_a (losing side) */
+    }
+
+    return bias;
+}
+
+/* =========================================================
  * Troll pick determination
  * ========================================================= */
 
@@ -574,6 +670,51 @@ void update_players_after_match(Match *m) {
         /* Soft reset check */
         apply_soft_reset(pa);
         apply_soft_reset(pb);
+
+        /* Engagement phase progression */
+        /* --- team_a player (pa) --- */
+        if (a_won) {
+            if (pa->engagement_phase == PHASE_WIN_STREAK) {
+                pa->phase_progress++;
+            } else if (pa->engagement_phase == PHASE_LOSE_STREAK) {
+                /* Premature exit from cold streak on a win (50% chance) */
+                if (randf() < 0.5f) {
+                    pa->engagement_phase = PHASE_NEUTRAL;
+                    pa->phase_progress   = 0;
+                }
+            }
+        } else {
+            if (pa->engagement_phase == PHASE_LOSE_STREAK) {
+                pa->phase_progress++;
+            } else if (pa->engagement_phase == PHASE_WIN_STREAK) {
+                /* Premature exit from hot streak on a loss (50% chance) */
+                if (randf() < 0.5f) {
+                    pa->engagement_phase = PHASE_NEUTRAL;
+                    pa->phase_progress   = 0;
+                }
+            }
+        }
+
+        /* --- team_b player (pb) --- */
+        if (b_won) {
+            if (pb->engagement_phase == PHASE_WIN_STREAK) {
+                pb->phase_progress++;
+            } else if (pb->engagement_phase == PHASE_LOSE_STREAK) {
+                if (randf() < 0.5f) {
+                    pb->engagement_phase = PHASE_NEUTRAL;
+                    pb->phase_progress   = 0;
+                }
+            }
+        } else {
+            if (pb->engagement_phase == PHASE_LOSE_STREAK) {
+                pb->phase_progress++;
+            } else if (pb->engagement_phase == PHASE_WIN_STREAK) {
+                if (randf() < 0.5f) {
+                    pb->engagement_phase = PHASE_NEUTRAL;
+                    pb->phase_progress   = 0;
+                }
+            }
+        }
     }
 }
 
@@ -764,14 +905,38 @@ static void create_matches_eomm(Player *players, int n,
 
         /* --- Fill remaining slots from any unassigned player --- */
         int any_n = 0;
+        float avg_mmr = 0.0f;
         for (int i = 0; i < n; i++) {
-            if (!assigned[i]) any_pool[any_n++] = &players[i];
+            if (!assigned[i]) {
+                any_pool[any_n++] = &players[i];
+                avg_mmr += players[i].visible_mmr;
+            }
         }
+        if (any_n > 0) avg_mmr /= (float)any_n;
         shuffle_ptrs(any_pool, any_n);
 
-        int ai = 0;
-        while ((a_count < TEAM_SIZE || b_count < TEAM_SIZE) && ai < any_n) {
-            Player *p = any_pool[ai++];
+        /* First pass: use engagement-phase bias to steer LOSE_STREAK →
+         * team_a and WIN_STREAK → team_b before falling back to balance.
+         * Higher bias (LOSE_STREAK) → team_a (losing side).
+         * Lower/negative bias (WIN_STREAK) → team_b (winning side). */
+        for (int ai = 0; ai < any_n; ai++) {
+            Player *p = any_pool[ai];
+            if (assigned[p - players]) continue;
+            float bias = calculate_matchmaking_bias(p,
+                             p->visible_mmr - avg_mmr);
+            /* Positive/high bias → prefer team_a (losing side) */
+            if (bias > 0.0f && a_count < TEAM_SIZE) {
+                match->team_a[a_count++] = p;
+                assigned[p - players] = 1;
+            } else if (bias <= 0.0f && b_count < TEAM_SIZE) {
+                match->team_b[b_count++] = p;
+                assigned[p - players] = 1;
+            }
+        }
+        /* Second pass: fill any still-empty slots by balance */
+        for (int ai = 0; ai < any_n; ai++) {
+            if (a_count >= TEAM_SIZE && b_count >= TEAM_SIZE) break;
+            Player *p = any_pool[ai];
             if (assigned[p - players]) continue;
             if (a_count <= b_count && a_count < TEAM_SIZE) {
                 match->team_a[a_count++] = p;

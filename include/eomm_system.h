@@ -85,10 +85,10 @@
 
 /* Compensation boost for players on 7+ consecutive losses */
 #define COMPENSATION_THRESHOLD  7       /* activate at 7 consecutive losses */
-#define COMPENSATION_MAX_BONUS  0.50f   /* 50% max win-probability boost    */
-#define COMPENSATION_BONUS_7    0.15f   /* +15% boost at exactly 7 losses   */
-#define COMPENSATION_BONUS_8    0.25f   /* +25% boost at exactly 8 losses   */
-#define COMPENSATION_BONUS_9    0.35f   /* +35% boost at exactly 9 losses   */
+#define COMPENSATION_MAX_BONUS  0.10f   /* 10% max win-probability boost    */
+#define COMPENSATION_BONUS_7    0.05f   /* +5%  boost at exactly 7 losses   */
+#define COMPENSATION_BONUS_8    0.08f   /* +8%  boost at exactly 8 losses   */
+#define COMPENSATION_BONUS_9    0.10f   /* +10% boost at exactly 9 losses   */
 
 /* Team / match sizes */
 #define TEAM_SIZE   5
@@ -124,6 +124,19 @@ typedef enum {
     STATE_NEUTRAL  =  0,
     STATE_POSITIVE =  1
 } HiddenState;
+
+/*
+ * EngagementPhase — orchestrates hot/cold streak narratives per player.
+ *
+ *   PHASE_NEUTRAL    : no active streak direction; transitions possible
+ *   PHASE_WIN_STREAK : player is in a hot streak (soft win bias)
+ *   PHASE_LOSE_STREAK: player is in a cold streak (soft lose bias)
+ */
+typedef enum {
+    PHASE_LOSE_STREAK = -1,  /* player in cold streak (must lose) */
+    PHASE_NEUTRAL     =  0,  /* player neutral, can go either way  */
+    PHASE_WIN_STREAK  =  1   /* player in hot streak (must win)    */
+} EngagementPhase;
 
 /* =========================================================
  * Structures
@@ -190,6 +203,11 @@ typedef struct {
     int         prefRoles[2];        /* preferred roles (ROLE_* constants)  */
     int         current_role;        /* role assigned for current game      */
     int         is_autofilled;       /* 1 if autofilled this game           */
+
+    /* Engagement phase — streak orchestration */
+    EngagementPhase engagement_phase;    /* current streak phase            */
+    int             phase_progress;      /* games played since phase start  */
+    int             target_streak;       /* target streak length (3-7)      */
 } Player;
 
 /*
@@ -221,6 +239,14 @@ typedef struct {
 /* =========================================================
  * Function declarations
  * ========================================================= */
+
+/* --- Engagement phase orchestration --- */
+
+/* Update engagement phase state (transition between NEUTRAL/WIN/LOSE streak). */
+void update_engagement_phase(Player *p);
+
+/* Apply soft hidden_factor modifiers based on current engagement phase. */
+void apply_engagement_phase_modifiers(Player *p);
 
 /* --- Player initialisation --- */
 void init_player(Player *p, int id, SkillLevel skill);
