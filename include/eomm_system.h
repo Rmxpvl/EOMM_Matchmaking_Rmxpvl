@@ -71,8 +71,35 @@
 #define PLAYER_NAME_LEN 32
 
 /* =========================================================
+ * Autofill constants
+ * Max total chance = base + EOMM bonus must stay below 10%
+ * ========================================================= */
+#define AUTOFILL_RISK_SUPPORT   2.0f  /* rarely contested              */
+#define AUTOFILL_RISK_JUNGLE    3.0f  /* protected / rare role          */
+#define AUTOFILL_RISK_MID       4.0f  /* normal demand                 */
+#define AUTOFILL_RISK_TOP       5.0f  /* normal demand                 */
+#define AUTOFILL_RISK_ADC       6.0f  /* highly contested role          */
+
+/* EOMM bonus applied when player is in STATE_NEGATIVE (max: 6%+3%=9%) */
+#define AUTOFILL_EOMM_BONUS     3.0f
+
+/* Tilt-resistance penalty applied when a player is autofilled */
+#define AUTOFILL_TILT_PENALTY   0.15f
+
+/* =========================================================
  * Enumerations
  * ========================================================= */
+
+/*
+ * Role — LoL roles used for autofill risk calculation.
+ */
+typedef enum {
+    ROLE_SUPPORT = 0,
+    ROLE_JUNGLE  = 1,
+    ROLE_MID     = 2,
+    ROLE_TOP     = 3,
+    ROLE_ADC     = 4
+} Role;
 
 /*
  * SkillLevel — permanent skill category assigned at player creation.
@@ -136,6 +163,12 @@ typedef struct {
     int         tilt_level;          /* 0=none, 1=light tilt, 2=heavy tilt */
     int         consecutive_trolls;  /* count of back-to-back troll picks   */
     int         is_troll_pick;       /* 1 if trolling this game             */
+
+    /* Role preferences (2 safe roles, 0-indexed using Role enum) */
+    Role        prefRoles[2];
+
+    /* Tilt resistance [0.0..1.0]: reduced by autofill penalty */
+    float       tilt_resistance;
 } Player;
 
 /*
@@ -209,6 +242,21 @@ int simulate_match(Match *m);
 
 /* Apply win/loss bookkeeping + MMR + tilt for every player in the match. */
 void update_players_after_match(Match *m);
+
+/* --- Autofill --- */
+
+/* Returns base autofill risk (%) for a given role. */
+float get_base_autofill_risk(Role role);
+
+/* Returns total autofill chance (%) for a player in their preferred role,
+ * adding EOMM bonus when the player is in STATE_NEGATIVE. */
+float calculate_autofill_chance(const Player *p, Role role);
+
+/* Returns 1 if the player should be autofilled out of their preferred role. */
+int should_autofill(const Player *p, Role pref_role);
+
+/* Assign a random non-preferred role and apply the tilt penalty. */
+void assign_autofill_role(Player *p);
 
 /* --- Analytics --- */
 

@@ -106,6 +106,14 @@ void init_player(Player *p, int id, SkillLevel skill) {
     p->tilt_level        = 0;
     p->consecutive_trolls = 0;
     p->is_troll_pick     = 0;
+
+    /* Assign two preferred roles randomly */
+    p->prefRoles[0] = (Role)(rand() % 5);
+    do {
+        p->prefRoles[1] = (Role)(rand() % 5);
+    } while (p->prefRoles[1] == p->prefRoles[0]);
+
+    p->tilt_resistance = 1.0f;
 }
 
 /*
@@ -317,8 +325,72 @@ float effective_mmr(const Player *p) {
 }
 
 /* =========================================================
- * Troll pick determination
+ * Autofill system
  * ========================================================= */
+
+/*
+ * get_base_autofill_risk — base autofill chance (%) per role.
+ * More popular roles have a higher base risk.
+ */
+float get_base_autofill_risk(Role role) {
+    switch (role) {
+        case ROLE_SUPPORT: return AUTOFILL_RISK_SUPPORT;
+        case ROLE_JUNGLE:  return AUTOFILL_RISK_JUNGLE;
+        case ROLE_MID:     return AUTOFILL_RISK_MID;
+        case ROLE_TOP:     return AUTOFILL_RISK_TOP;
+        case ROLE_ADC:     return AUTOFILL_RISK_ADC;
+        default:           return AUTOFILL_RISK_MID;
+    }
+}
+
+/*
+ * calculate_autofill_chance — total autofill chance (%) for a player.
+ * Adds EOMM bonus when the player is in STATE_NEGATIVE (already tilted),
+ * keeping the maximum below 10% (6% + 3% = 9%).
+ */
+float calculate_autofill_chance(const Player *p, Role role) {
+    float chance = get_base_autofill_risk(role);
+    if (p->hidden_state == STATE_NEGATIVE) {
+        chance += AUTOFILL_EOMM_BONUS;
+    }
+    return chance;
+}
+
+/*
+ * should_autofill — roll whether the player gets autofilled out of pref_role.
+ * Returns 1 if autofilled, 0 otherwise.
+ */
+int should_autofill(const Player *p, Role pref_role) {
+    float chance = calculate_autofill_chance(p, pref_role);
+    return (randf() * 100.0f < chance) ? 1 : 0;
+}
+
+/*
+ * assign_autofill_role — assign a random non-preferred role and apply the
+ * tilt penalty.  Autofilled players get frustrated and tilt more easily.
+ */
+void assign_autofill_role(Player *p) {
+    /* Build a list of roles not in the player's two preferred roles */
+    Role candidates[5];
+    int  n_candidates = 0;
+
+    for (int r = 0; r < 5; r++) {
+        if ((Role)r != p->prefRoles[0] && (Role)r != p->prefRoles[1]) {
+            candidates[n_candidates++] = (Role)r;
+        }
+    }
+
+    /* At least one non-preferred role must exist (5 roles, 2 preferred) */
+    if (n_candidates > 0) {
+        p->prefRoles[0] = candidates[rand() % n_candidates];
+    }
+
+    /* Autofill makes the player frustrated: reduce tilt resistance */
+    p->tilt_resistance = clampf(p->tilt_resistance - AUTOFILL_TILT_PENALTY,
+                                0.0f, 1.0f);
+}
+
+
 
 /*
  * determine_troll_picks — roll troll probability for every player in a match.
@@ -544,6 +616,18 @@ static void create_matches_eomm(Player *players, int n,
                 match->team_a[a_count++] = p;
             }
             assigned[p - players] = 1;
+        }
+
+        /* --- Apply autofill to each assigned player --- */
+        for (int i = 0; i < TEAM_SIZE; i++) {
+            if (match->team_a[i] && should_autofill(match->team_a[i],
+                                                     match->team_a[i]->prefRoles[0])) {
+                assign_autofill_role(match->team_a[i]);
+            }
+            if (match->team_b[i] && should_autofill(match->team_b[i],
+                                                     match->team_b[i]->prefRoles[0])) {
+                assign_autofill_role(match->team_b[i]);
+            }
         }
 
         /* Log MMR imbalance warning */
