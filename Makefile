@@ -147,6 +147,56 @@ test: test_autofill test_debug_autofill test_coefficient_analysis test_performan
 	$(TEST_50G_TARGET)
 	@echo "50-games simulation complete."
 
+# ── Python EOMM tools ────────────────────────────────────────
+TOOLS = python3 src/scripts/eomm_tools.py
+
+.PHONY: analyze simulate track fix report
+
+analyze:
+	$(TOOLS) analyze-match
+
+simulate:
+	$(TOOLS) simulate-aggressive
+
+track:
+	$(TOOLS) track-hidden-advanced
+
+fix:
+	@echo "Available fix commands:"
+	@echo "  make fix-hardstuck-blend"
+	@echo "  make fix-hardstuck-final"
+	@echo "  make fix-hardstuck-perf"
+	@echo "  make fix-hardstuck-v2"
+	@echo "  make fix-hardstuck-wr"
+	@echo "  make fix-update-tilt"
+	@echo "  make fix-wr"
+
+fix-hardstuck-blend:
+	$(TOOLS) fix-hardstuck-blend
+
+fix-hardstuck-final:
+	$(TOOLS) fix-hardstuck-final
+
+fix-hardstuck-perf:
+	$(TOOLS) fix-hardstuck-perf
+
+fix-hardstuck-v2:
+	$(TOOLS) fix-hardstuck-v2
+
+fix-hardstuck-wr:
+	$(TOOLS) fix-hardstuck-wr
+
+fix-update-tilt:
+	$(TOOLS) fix-update-tilt
+
+fix-wr:
+	$(TOOLS) fix-wr
+
+report:
+	$(TOOLS) final-report
+
+.PHONY: fix-hardstuck-blend fix-hardstuck-final fix-hardstuck-perf fix-hardstuck-v2 fix-hardstuck-wr fix-update-tilt fix-wr
+
 # Clean
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR)
