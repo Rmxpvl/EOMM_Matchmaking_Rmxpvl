@@ -33,6 +33,7 @@ autofill_stats.csv
 
 # Large data files
 data/match_history.json
+match_history.json
 
 # Python cache
 __pycache__/

@@ -79,6 +79,14 @@ static void run_simulation(Player *players, int n_players,
         create_matches(players, n_players, matches, &num_matches, g);
 
         for (int m = 0; m < num_matches; m++) {
+            /* Update engagement phases before each match */
+            for (int i = 0; i < TEAM_SIZE; i++) {
+                update_engagement_phase(matches[m].team_a[i]);
+                apply_engagement_phase_modifiers(matches[m].team_a[i]);
+                update_engagement_phase(matches[m].team_b[i]);
+                apply_engagement_phase_modifiers(matches[m].team_b[i]);
+            }
+
             determine_troll_picks(&matches[m]);
             simulate_match(&matches[m]);
             update_players_after_match(&matches[m]);
