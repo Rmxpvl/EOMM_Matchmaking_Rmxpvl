@@ -104,11 +104,11 @@ void init_player(Player *p, int id, SkillLevel skill) {
     float lo, hi, adj_delta;
     switch (skill) {
         case SKILL_SMURF:
-            lo = 0.70f; hi = 0.90f;
-            adj_delta = -0.10f; /* one weaker stat */
+            lo = 0.62f; hi = 0.78f;  /* FURTHER REDUCED */
+            adj_delta = -0.08f; /* one weaker stat */
             break;
         case SKILL_HARDSTUCK:
-            lo = 0.01f; hi = 0.12f;  /* DRASTIC REDUCTION */
+            lo = 0.01f; hi = 0.12f;  /* Tight range for low WR */
             adj_delta = +0.04f; /* minimal boost */
             break;
         default: /* SKILL_NORMAL */
