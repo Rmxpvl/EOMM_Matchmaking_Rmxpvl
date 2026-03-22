@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "eomm_system.c"
+#include "../src/eomm_system.c"
 
 int main() {
     int players[100];

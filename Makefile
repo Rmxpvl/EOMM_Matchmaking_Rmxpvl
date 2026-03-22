@@ -42,8 +42,18 @@ TEST_50G_TARGET  = $(BIN_DIR)/test_50_games_detailed
 TEST_50G_SRCS    = $(SRC_DIR)/eomm_system.c tests/test_50_games_detailed.c
 TEST_50G_INCLUDE = -I$(INC_DIR)
 
+# ── EOMM auto 200-games test target ──────────────────────
+TEST_AUTO200_TARGET  = $(BIN_DIR)/test_eomm_auto_200games
+TEST_AUTO200_SRCS    = tests/test_eomm_auto_200games.c
+TEST_AUTO200_INCLUDE = -I$(INC_DIR)
+
+# ── Full EOMM 200-games test target ──────────────────────
+TEST_FULL200_TARGET  = $(BIN_DIR)/test_full_eomm_200games
+TEST_FULL200_SRCS    = tests/test_full_eomm_200games.c
+TEST_FULL200_INCLUDE = -I$(INC_DIR)
+
 # ── Default target ────────────────────────────────────────
-.PHONY: all build eomm clean run test test_autofill test_debug_autofill test_coefficient_analysis test_performance_stats test_50_games_detailed
+.PHONY: all build eomm clean run test test_autofill test_debug_autofill test_coefficient_analysis test_performance_stats test_50_games_detailed test_eomm_auto_200games test_full_eomm_200games
 
 all: eomm
 
@@ -95,6 +105,18 @@ test_50_games_detailed: $(BIN_DIR) $(TEST_50G_TARGET)
 
 $(TEST_50G_TARGET): $(TEST_50G_SRCS) $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(TEST_50G_INCLUDE) -o $@ $(TEST_50G_SRCS)
+
+# Build EOMM auto 200-games test
+test_eomm_auto_200games: $(BIN_DIR) $(TEST_AUTO200_TARGET)
+
+$(TEST_AUTO200_TARGET): $(TEST_AUTO200_SRCS)
+	$(CC) $(CFLAGS) $(TEST_AUTO200_INCLUDE) -o $@ $(TEST_AUTO200_SRCS)
+
+# Build full EOMM 200-games test
+test_full_eomm_200games: $(BIN_DIR) $(TEST_FULL200_TARGET)
+
+$(TEST_FULL200_TARGET): $(TEST_FULL200_SRCS)
+	$(CC) $(CFLAGS) $(TEST_FULL200_INCLUDE) -o $@ $(TEST_FULL200_SRCS)
 
 # Run EOMM system (interactive)
 run: eomm
