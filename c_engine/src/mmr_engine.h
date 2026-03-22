@@ -1,0 +1,1 @@
+#ifndef MMR_ENGINE_H\n#define MMR_ENGINE_H\n\n// Function declarations\nvoid calculateHiddenFactor();\nvoid calculateChatToxicity();\nvoid calculatePingSpamScore();\nvoid calculateTiltLevel();\nvoid calculateEffectiveMMR();\nvoid resetHiddenMMR();\nvoid softResetHiddenMMR();\nvoid updatePlayerStats();\n\n#endif // MMR_ENGINE_H
