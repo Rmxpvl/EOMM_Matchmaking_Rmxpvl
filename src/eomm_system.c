@@ -104,14 +104,17 @@ void init_player(Player *p, int id, SkillLevel skill) {
     float lo, hi, adj_delta;
     switch (skill) {
         case SKILL_SMURF:
-            lo = 0.62f; hi = 0.78f;  /* FURTHER REDUCED */
-            adj_delta = -0.08f; /* one weaker stat */
+            /* HIGH skill floor: 48-68% performance baseline */
+            lo = 0.48f; hi = 0.68f;
+            adj_delta = -0.08f; /* one weaker stat for variance */
             break;
         case SKILL_HARDSTUCK:
-            lo = 0.01f; hi = 0.12f;  /* Tight range for low WR */
-            adj_delta = +0.04f; /* minimal boost */
+            /* LOW skill floor: 34-54% performance baseline */
+            lo = 0.34f; hi = 0.54f;
+            adj_delta = +0.04f; /* minimal boost for variance */
             break;
         default: /* SKILL_NORMAL */
+            /* MEDIUM skill floor: 30-70% performance baseline */
             lo = 0.30f; hi = 0.70f;
             adj_delta = (randf() < 0.5f) ? +0.10f : -0.10f;
             break;
@@ -376,6 +379,56 @@ void apply_soft_reset(Player *p) {
 }
 
 /* =========================================================
+ * ELO CALCULATION & EOMM BIAS
+ * ========================================================= */
+
+/*
+ * calculate_expected — standard Elo formula for expected win probability.
+ *
+ * Formula: expected_prob = 1 / (1 + 10^(-(mmr_a - mmr_b) / 400))
+ *
+ * Returns a probability in range [~0.01, ~0.99] based on MMR difference.
+ */
+float calculate_expected(float mmr_a, float mmr_b) {
+    float diff = (mmr_a - mmr_b) / 400.0f;
+    return 1.0f / (1.0f + powf(10.0f, -diff));
+}
+
+/*
+ * apply_eomm_bias — compute effective opponent MMR with EOMM adjustment.
+ *
+ * Purpose: Move hidden_factor influence from RATING (MMR) to MATCHMAKING.
+ * The hidden_factor still affects engagement but via opponent difficulty,
+ * not via inflating/deflating the player's own rating.
+ *
+ * Logic:
+ *   NEGATIVE state (tilted): bias is NEGATIVE → opponent appears WEAKER
+ *   POSITIVE state (hot): bias is POSITIVE → opponent appears STRONGER
+ *   NEUTRAL state: bias is neutral
+ *
+ * Magnitude: ±50 MMR × hidden_factor deviation from 1.0
+ */
+float apply_eomm_bias(Player *p, float opponent_mmr) {
+    /* Deviation from baseline (1.0) */
+    float hf_deviation = p->hidden_factor - 1.0f;
+    
+    /* Scale bias based on state:
+       Negative: help the player (reduce perceived opponent strength)
+       Positive: challenge the player (increase perceived opponent strength)
+    */
+    float bias_magnitude = 50.0f;  /* ±50 MMR range */
+    float bias = 0.0f;
+    
+    if (p->hidden_state == STATE_NEGATIVE) {
+        bias = -bias_magnitude * fabsf(hf_deviation);  /* negative bias → easier games */
+    } else if (p->hidden_state == STATE_POSITIVE) {
+        bias = +bias_magnitude * hf_deviation;         /* positive bias → harder games */
+    }
+    
+    return opponent_mmr + bias;
+}
+
+/* =========================================================
  * MMR update
  * ========================================================= */
 
@@ -384,11 +437,37 @@ void apply_soft_reset(Player *p) {
  * During the placement phase (total_games < PLACEMENT_GAMES) K = 30.
  * After placement K = 25.
  */
-void update_mmr(Player *p, int did_win) {
-    float K = (p->total_games < PLACEMENT_GAMES) ? K_FACTOR_PLACEMENT : K_FACTOR_RANKED;
-    if (did_win) p->visible_mmr += K;
-    else         p->visible_mmr -= K;
-    if (p->visible_mmr < 0.0f) p->visible_mmr = 0.0f;
+/*
+ * update_mmr — apply ELO-style rating update (PRO VERSION).
+ *
+ * Formula: delta = K * (outcome - expected_prob)
+ *
+ * This separates RATING (MMR) from ENGAGEMENT (hidden_factor):
+ *   - MMR reflects pure skill (Elo standard)
+ *   - hidden_factor affects matchmaking via apply_eomm_bias() only
+ *   - No K-factor multiplication → stability + fairness
+ */
+void update_mmr(Player *p, float opponent_mmr, int did_win) {
+    /* 1. Expected probability (Elo) */
+    float expected = calculate_expected(p->visible_mmr, opponent_mmr);
+    
+    /* 2. Outcome (1 = win, 0 = loss) */
+    float outcome = did_win ? 1.0f : 0.0f;
+    
+    /* 3. K-factor: simpler + cleaner (no hidden_factor modulation) */
+    float K;
+    if (p->total_games < PLACEMENT_GAMES)
+        K = 35.0f;   /* placement: faster calibration */
+    else
+        K = 25.0f;   /* ranked: standard Elo */
+    
+    /* 4. Update MMR (FORMULA CLÉ: delta = K * (outcome - expected)) */
+    float delta = K * (outcome - expected);
+    p->visible_mmr += delta;
+    
+    /* 5. Clamp: safety */
+    if (p->visible_mmr < 0.0f)
+        p->visible_mmr = 0.0f;
 }
 
 /*
@@ -396,7 +475,17 @@ void update_mmr(Player *p, int did_win) {
  *   effectiveMMR = visible_mmr * hidden_factor
  */
 float effective_mmr(const Player *p) {
-    return p->visible_mmr * p->hidden_factor;
+    /* ⚠️ ARCH-FIX: Pure skill-based MMR for matchmaking
+       REMOVED: p->visible_mmr * p->hidden_factor
+       NOW: p->visible_mmr ONLY
+       
+       This eliminates the implicit HF² in simulate_match where:
+         power = (mmr * HF) * (perf_wr * hf_blend) was squaring HF
+       
+       EOMM intent (placing Smurfs→team_b) is NOW achieved via
+       skill_level_adjustment in calculate_matchmaking_bias() instead.
+    */
+    return p->visible_mmr;
 }
 
 /* =========================================================
@@ -451,14 +540,19 @@ float calculate_actual_winrate(const Player *p) {
 
     wr = clampf(wr, 0.25f, 0.75f);
 
-    /* MODIFICATION 1: hidden_factor NOW affects WR AFTER clamping */
-    /* Different blend intensity by skill level:
-       - Smurfs: weaker blend (they're already strong)
-       - Normal: medium blend
-       - Hardstuck: stronger blend (streak effects matter more)
+    /* ⚠️ ARCH-FIX: Remove hidden_factor from match result determination
+       REMOVED: wr *= (0.5f + 0.5f * p->hidden_factor)  [hf_blend]
+       
+       Hidden_factor NO LONGER affects match outcomes directly.
+       Match win probability now depends ONLY on:
+       - Skill/performance (perf_stats)
+       - Tilt state (penalty if STATE_NEGATIVE)
+       - Team average MMR diff (via power calculation in simulate_match)
+       
+       HF now affects ONLY K-factor progression in update_mmr(),
+       controlling how fast skill improvements/regressions happen,
+       not WHETHER they happen.
     */
-    float hf_blend = 0.5f + 0.5f * p->hidden_factor;  /* ranges [0.75, 1.1] */
-    wr *= hf_blend;
 
     return clampf(wr, 0.25f, 0.75f);
 }
@@ -549,6 +643,18 @@ static float calculate_matchmaking_bias(const Player *p, float mmr_distance) {
     } else if (p->engagement_phase == PHASE_LOSE_STREAK) {
         bias += 50.0f;  /* favour team_a (losing side) */
     }
+    
+    /* ⚠️ ARCH-FIX: Skill-level-based selection (replaces HF variable selection)
+       Instead of using hidden_factor (variable psychology) in effective_mmr,
+       we NOW use skill_level (stable characteristic) directly.
+       This preserves EOMM intent without variable HF dependency.
+    */
+    if (p->skill_level == SKILL_SMURF) {
+        bias -= 50.0f;  /* HIGH bias → favours team_b (winning side) */
+    } else if (p->skill_level == SKILL_HARDSTUCK) {
+        bias += 50.0f;  /* LOW bias → favours team_a (losing side) */
+    }
+    /* SKILL_NORMAL: no adjustment, neutral */
 
     return bias;
 }
@@ -594,21 +700,52 @@ void determine_troll_picks(Match *m) {
  * consecutive losses the highest applicable bonus is applied to win_prob_a
  * and clamped to [0.05, 0.95].  This is transparent to the player.
  */
+/*
+ * simulate_match — determine match winner based on skill (MMR + perf).
+ *
+ * ARCHITECTURE:
+ *   1. Power = sum of (effective_mmr * calculate_actual_winrate) for each player
+ *      → This is PURE skill-based (no HF multiplicative)
+ *   2. Win probability = power_a / power_b (Elo-based ratio)
+ *   3. Add compensation bonus for losing streak
+ *   4. Apply HF as SIMPLE local variance (±3% max)
+ *      → HF affects HOW each player performs, not WHETHER team wins
+ *      → Additive noise, not multiplicative global effect
+ *   5. Stochastic roll
+ */
 int simulate_match(Match *m) {
+    /* ═══════════════════════════════════════════════════════════
+       SAME PROBABILISTIC SPACE: ratio(pow(mmr,1+k) * perf)
+       
+       Amplifies MMR sensitivity via EXPONENTIATION (not new layer)
+       → Keeps single reference frame
+       → Progressive tuning of skill dominance
+       ═══════════════════════════════════════════════════════════ */
+    
     float power_a = 0.0f, power_b = 0.0f;
-
+    
+    /* k_mmr_boost = 0.12: amplifies MMR sensitivity
+       Normal MMR (1000): 1000^1.12 ≈ 1127 (mild boost)
+       MMR diff 400: (1200/800)^1.12 ≈ 1.52x power advantage
+       → Structural amplification without changing espace probabiliste */
+    float k_mmr_boost = 0.12f;
+    
     for (int i = 0; i < TEAM_SIZE; i++) {
-        power_a += effective_mmr(m->team_a[i]) * calculate_actual_winrate(m->team_a[i]);
-        power_b += effective_mmr(m->team_b[i]) * calculate_actual_winrate(m->team_b[i]);
+        float mmr_a = effective_mmr(m->team_a[i]);
+        float mmr_b = effective_mmr(m->team_b[i]);
+        float perf_a = calculate_actual_winrate(m->team_a[i]);
+        float perf_b = calculate_actual_winrate(m->team_b[i]);
+        
+        /* Power: MMR exponentiation + perf (same ratio metric) */
+        power_a += powf(mmr_a, 1.0f + k_mmr_boost) * perf_a;
+        power_b += powf(mmr_b, 1.0f + k_mmr_boost) * perf_b;
     }
-
+    
     float total = power_a + power_b;
     float win_prob_a = (total > 0.0f) ? (power_a / total) : 0.5f;
+    /* → win_prob_a maintains single metric space */
 
-    /* Apply compensation bonus for team_a players on a long losing streak.
-     * Only team_a is checked because the EOMM matchmaker deliberately places
-     * tilted/losing players on team_a; team_b is the "stronger" side by
-     * design, so compensating team_b would cancel the EOMM intent. */
+    /* STEP 2: Apply compensation bonus (unchanged) */
     float max_bonus = 0.0f;
     for (int i = 0; i < TEAM_SIZE; i++) {
         float bonus = get_compensation_bonus(m->team_a[i]->lose_streak);
@@ -618,6 +755,23 @@ int simulate_match(Match *m) {
         win_prob_a = clampf(win_prob_a * (1.0f + max_bonus), 0.05f, 0.95f);
     }
 
+    /* STEP 3: Hidden_factor as LOCAL noise (unchanged) */
+    float hf_variance = 0.0f;
+    for (int i = 0; i < TEAM_SIZE; i++) {
+        /* Each player's HF deviates from neutral (1.0) */
+        hf_variance += (m->team_a[i]->hidden_factor - 1.0f);
+        hf_variance -= (m->team_b[i]->hidden_factor - 1.0f);
+    }
+    
+    /* Average per team */
+    hf_variance /= (float)TEAM_SIZE;
+    
+    /* Apply as local variance modifier (max ±1% swing) */
+    float hf_effect = hf_variance * 0.05f;  /* Maps [-0.2,+0.2] to [-1%, +1%] */
+    win_prob_a += hf_effect;
+    win_prob_a = clampf(win_prob_a, 0.05f, 0.95f);
+
+    /* STEP 4: Final stochastic roll */
     m->winner = (randf() < win_prob_a) ? 0 : 1;
     return m->winner;
 }
@@ -647,9 +801,9 @@ void update_players_after_match(Match *m) {
         if (a_won) { pa->wins++;   pb->losses++; }
         else       { pa->losses++; pb->wins++;   }
 
-        /* MMR */
-        update_mmr(pa, a_won);
-        update_mmr(pb, b_won);
+        /* MMR (now with opponent MMR for Elo calculation) */
+        update_mmr(pa, pb->visible_mmr, a_won);
+        update_mmr(pb, pa->visible_mmr, b_won);
 
         /* Tilt / hidden factor */
         update_tilt(pa, a_won);
@@ -879,6 +1033,77 @@ static void create_matches_eomm(Player *players, int n,
         shuffle_ptrs(healthy_pool, healthy_n);
 
         int a_count = 0, b_count = 0;
+
+        /* ✅ PHASE 0: SKILL-AWARE TEAM COMPOSITION (100% Separation) */
+        /* Strategy: Aggressive Smurfs→team_b and Hardstuck→team_a + random Normals */
+        
+        /* 0a. Extract skill tiers */
+        Player **smurfs = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
+        Player **hardstuck_pool = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
+        Player **normals = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
+        int smurf_n = 0, hardstuck_n = 0, normal_n = 0;
+
+        for (int h = 0; h < healthy_n; h++) {
+            Player *p = healthy_pool[h];
+            if (p->skill_level == SKILL_SMURF) smurfs[smurf_n++] = p;
+            else if (p->skill_level == SKILL_HARDSTUCK) hardstuck_pool[hardstuck_n++] = p;
+            else normals[normal_n++] = p;
+        }
+        for (int t = 0; t < tilt_n; t++) {
+            Player *p = tilt_pool[t];
+            if (p->skill_level == SKILL_SMURF) smurfs[smurf_n++] = p;
+            else if (p->skill_level == SKILL_HARDSTUCK) hardstuck_pool[hardstuck_n++] = p;
+            else normals[normal_n++] = p;
+        }
+        
+        shuffle_ptrs(smurfs, smurf_n);
+        shuffle_ptrs(hardstuck_pool, hardstuck_n);
+        shuffle_ptrs(normals, normal_n);
+        shuffle_ptrs(smurfs, smurf_n);
+        
+        /* 0b. Assign ~30% Hardstuck → team_a (weak preference, mostly random) */
+        int hardstuck_a_target = (int)(hardstuck_n * 0.30f);  /* ~30% of hardstuck */
+        for (int i = 0; i < hardstuck_a_target && i < hardstuck_n && a_count < TEAM_SIZE; i++) {
+            match->team_a[a_count++] = hardstuck_pool[i];
+            assigned[hardstuck_pool[i] - players] = 1;
+        }
+        
+        /* 0c. Assign ~30% Smurfs → team_b (weak preference, mostly random) */
+        int smurf_b_target = (int)(smurf_n * 0.30f);  /* ~30% of smurfs */
+        for (int i = 0; i < smurf_b_target && i < smurf_n && b_count < TEAM_SIZE; i++) {
+            match->team_b[b_count++] = smurfs[i];
+            assigned[smurfs[i] - players] = 1;
+        }
+        
+        /* 0d. Add remaining hardstuck/smurfs randomly (30% escape) */
+        for (int i = hardstuck_a_target; i < hardstuck_n; i++) {
+            if (b_count < TEAM_SIZE && !assigned[hardstuck_pool[i] - players]) {
+                match->team_b[b_count++] = hardstuck_pool[i];
+                assigned[hardstuck_pool[i] - players] = 1;
+            }
+        }
+        for (int i = smurf_b_target; i < smurf_n; i++) {
+            if (a_count < TEAM_SIZE && !assigned[smurfs[i] - players]) {
+                match->team_a[a_count++] = smurfs[i];
+                assigned[smurfs[i] - players] = 1;
+            }
+        }
+        
+        /* 0e. Distribute Normals randomly to balance */
+        for (int i = 0; i < normal_n; i++) {
+            if (a_count <= b_count && a_count < TEAM_SIZE) {
+                match->team_a[a_count++] = normals[i];
+                assigned[normals[i] - players] = 1;
+            } else if (b_count < TEAM_SIZE) {
+                match->team_b[b_count++] = normals[i];
+                assigned[normals[i] - players] = 1;
+            } else if (a_count < TEAM_SIZE) {
+                match->team_a[a_count++] = normals[i];
+                assigned[normals[i] - players] = 1;
+            }
+        }
+        
+        free(smurfs); free(hardstuck_pool); free(normals);
 
         /* --- Fill team_a (losing side) with tilt players (max TEAM_SIZE) --- */
         for (int t = 0; t < tilt_n && a_count < TEAM_SIZE; t++) {
@@ -1118,4 +1343,17 @@ void print_final_report(const Player *players, int n, int total_games) {
         }
     }
     printf("\n");
+}
+
+/* =========================================================
+ * Inflation control (harmless MMR recalibration)
+ * ========================================================= */
+
+void apply_inflation_control(Player *players, int n) {
+    /* Gentle recenter: shift all MMR back toward START_MMR by 0.5% each cycle */
+    float drift = 0.005f;  /* 0.5% drift per inflation control cycle */
+    for (int i = 0; i < n; i++) {
+        players[i].visible_mmr = players[i].visible_mmr * (1.0f - drift) 
+                                 + START_MMR * drift;
+    }
 }

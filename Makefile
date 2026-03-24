@@ -66,6 +66,9 @@ $(EOMM_TARGET): $(EOMM_OBJS)
 $(OBJ_DIR)/eomm_system.o: $(SRC_DIR)/eomm_system.c $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(EOMM_INCLUDE) -c $< -o $@
 
+$(OBJ_DIR)/match_history.o: $(SRC_DIR)/match_history.c $(INC_DIR)/eomm_system.h
+	$(CC) $(CFLAGS) $(EOMM_INCLUDE) -c $< -o $@
+
 $(OBJ_DIR)/eomm_main.o: $(SRC_DIR)/eomm_main.c $(INC_DIR)/eomm_system.h
 	$(CC) $(CFLAGS) $(EOMM_INCLUDE) -c $< -o $@
 
@@ -200,12 +203,3 @@ report:
 # Clean
 clean:
 	rm -rf $(BIN_DIR) $(OBJ_DIR)
-
-# ── EOMM system target ────────────────────────────────
-EOMM_TARGET  = $(BIN_DIR)/eomm_system
-EOMM_SRCS    = $(SRC_DIR)/eomm_system.c $(SRC_DIR)/match_history.c $(SRC_DIR)/eomm_main.c
-EOMM_OBJS    = $(OBJ_DIR)/eomm_system.o $(OBJ_DIR)/match_history.o $(OBJ_DIR)/eomm_main.o
-EOMM_INCLUDE = -I$(INC_DIR)
-
-$(OBJ_DIR)/match_history.o: $(SRC_DIR)/match_history.c $(INC_DIR)/eomm_system.h
-	$(CC) $(CFLAGS) $(EOMM_INCLUDE) -c $< -o $@

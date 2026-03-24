@@ -40,6 +40,9 @@
 #define HIDDEN_FACTOR_MIN       0.50f /* floor for hidden_factor */
 #define HIDDEN_FACTOR_MAX       1.20f /* ceiling for hidden_factor */
 #define HIDDEN_FACTOR_START     1.00f /* initial hidden_factor */
+#define UNCERTAINTY_START       1.0f
+#define UNCERTAINTY_DECAY       0.90f
+#define UNCERTAINTY_MIN         0.30f
 
 /* Troll probability */
 #define TROLL_BASE_HIGH_FACTOR  15.0f /* % troll chance when factor >= 0.95 */
@@ -83,12 +86,19 @@
 #define AUTOFILL_POST_WIN_PENALTY   0.08f  /* additional hidden_factor penalty on win        */
 #define AUTOFILL_POST_LOSS_PENALTY  0.15f  /* additional hidden_factor penalty on loss       */
 
-/* Compensation boost for players on 7+ consecutive losses */
+/* Momentum system — subtle streak encouragement */
+#define MOMENTUM_WIN_GAIN       0.15f   /* momentum += on a win                  */
+#define MOMENTUM_LOSS_COST      0.20f   /* momentum -= on a loss (asymmetric)   */
+#define MOMENTUM_MIN           -1.0f    /* negative spiral floor                */
+#define MOMENTUM_MAX            1.0f    /* positive streak ceiling              */
+#define MOMENTUM_POWER_SCALE    0.3f    /* how much momentum affects player_power */
+
+/* Compensation boost for players on 7+ consecutive losses (REDUCED) */
 #define COMPENSATION_THRESHOLD  7       /* activate at 7 consecutive losses */
-#define COMPENSATION_MAX_BONUS  0.10f   /* 10% max win-probability boost    */
-#define COMPENSATION_BONUS_7    0.05f   /* +5%  boost at exactly 7 losses   */
-#define COMPENSATION_BONUS_8    0.08f   /* +8%  boost at exactly 8 losses   */
-#define COMPENSATION_BONUS_9    0.10f   /* +10% boost at exactly 9 losses   */
+#define COMPENSATION_MAX_BONUS  0.03f   /* REDUCED: 3% max win-probability boost */
+#define COMPENSATION_BONUS_7    0.01f   /* REDUCED: +1%  boost at exactly 7 losses */
+#define COMPENSATION_BONUS_8    0.02f   /* REDUCED: +2%  boost at exactly 8 losses */
+#define COMPENSATION_BONUS_9    0.03f   /* REDUCED: +3%  boost at exactly 9 losses */
 
 /* Team / match sizes */
 #define TEAM_SIZE   5
@@ -110,6 +120,24 @@ typedef enum {
     SKILL_SMURF     = 1,  /* 10% of players — stats 70-90%  (WR emerges ~56-60%) */
     SKILL_HARDSTUCK = 2   /* 10% of players — stats 10-35%  (WR emerges ~35-42%) */
 } SkillLevel;
+
+/*
+ * Rank — visible rank tier based on MMR (like League of Legends)
+ *   Bronze    : 0 - 1200
+ *   Silver    : 1200 - 2000
+ *   Gold      : 2000 - 3000
+ *   Platinum  : 3000 - 4000
+ *   Diamond   : 4000 - 5500
+ *   Master    : 5500+
+ */
+typedef enum {
+    RANK_BRONZE    = 0,
+    RANK_SILVER    = 1,
+    RANK_GOLD      = 2,
+    RANK_PLATINUM  = 3,
+    RANK_DIAMOND   = 4,
+    RANK_MASTER    = 5
+} Rank;
 
 /*
  * HiddenState — player's current mental / behavioral category.
@@ -177,6 +205,14 @@ typedef struct {
 
     /* Visible MMR (what the player sees) */
     float visible_mmr;
+    
+    /* League of Legends style system */
+    Rank current_rank;              /* Visible rank (Bronze-Master) */
+    int league_points;              /* LP within rank [0-99] */
+    float hidden_mmr;               /* Hidden MMR for LP gain calculation */
+
+    /* Uncertainty used for placement games (MMR volatility early game) */
+    float mmr_uncertainty;
 
     /* Hidden factor [0.50..1.20]:
      *   1.0  = neutral mental state
@@ -208,6 +244,12 @@ typedef struct {
     EngagementPhase engagement_phase;    /* current streak phase            */
     int             phase_progress;      /* games played since phase start  */
     int             target_streak;       /* target streak length (3-7)      */
+
+    /* Momentum [-1.0, +1.0]: subtle bias towards extend streaks */
+    float momentum;                     /* psychological game momentum      */
+    
+    /* Placement games tracking */
+    int is_in_placement;                /* 1 if playing placement games (first 10) */
 } Player;
 
 /*
@@ -239,6 +281,13 @@ typedef struct {
 /* =========================================================
  * Function declarations
  * ========================================================= */
+
+/* --- Rank system --- */
+Rank get_rank_from_mmr(float mmr);
+const char* rank_name(Rank r);
+
+/* Calculate LP gain/loss based on hidden_mmr vs visible rank mismatch */
+float calculate_lp_gain(const Player *p, int did_win);
 
 /* --- Engagement phase orchestration --- */
 
@@ -276,11 +325,20 @@ void update_tilt(Player *p, int did_win);
 /* Soft reset every SOFT_RESET_INTERVAL games (tilt→0, factor→1.0). */
 void apply_soft_reset(Player *p);
 
-/* Apply MMR delta (K-factor depends on total_games). */
-void update_mmr(Player *p, int did_win);
+/* ELO calculation for expected win probability. */
+float calculate_expected(float mmr_a, float mmr_b);
+
+/* Apply EOMM matchmaking bias (hidden_factor via opponent difficulty). */
+float apply_eomm_bias(Player *p, float opponent_mmr);
+
+/* Apply MMR delta using ELO formula: delta = K * (outcome - expected). */
+void update_mmr(Player *p, float opponent_mmr, int did_win);
 
 /* Effective MMR used for matchmaking / team power: visible_mmr * hidden_factor. */
 float effective_mmr(const Player *p);
+
+/* Compute individual player power (MMR × win rate) for team strength evaluation. */
+float player_power(Player *p);
 
 /* --- Matchmaking --- */
 
@@ -322,6 +380,13 @@ void print_stats(const SkillStats stats[3]);
 
 /* Print the final comprehensive simulation report. */
 void print_final_report(const Player *players, int n, int total_games);
+
+/* Compute average MMR across all players (used for inflation control). */
+float compute_avg_mmr(const Player *players, int n);
+
+/* Apply gentle inflation control: recenters MMR if it drifts above START_MMR.
+ * This prevents unbounded growth while preserving relative differences. */
+void apply_inflation_control(Player *players, int n);
 
 
 /* =========================================================
