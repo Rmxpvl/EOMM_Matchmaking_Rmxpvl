@@ -1,0 +1,28 @@
+    /* Find smurfs for tracking */
+    int smurf_indices[50];  /* max 50 smurfs */
+    int smurf_count = 0;
+    
+    int low_bad_indices[10];
+    int low_bad_count = 0;
+    int low_very_bad_indices[10];
+    int low_very_bad_count = 0;
+    int low_extreme_indices[10];
+    int low_extreme_count = 0;
+    int normal_indices[10];
+    int normal_count_track = 0;
+    
+    for (int i = 0; i < N_PLAYERS; i++) {
+        if (players[i].artificially_low) {
+            if (smurf_count < 50) smurf_indices[smurf_count++] = i;
+        } else {
+            if (players[i].skill_level == SKILL_LOW_BAD && low_bad_count < 10) {
+                low_bad_indices[low_bad_count++] = i;
+            } else if (players[i].skill_level == SKILL_LOW_VERY_BAD && low_very_bad_count < 10) {
+                low_very_bad_indices[low_very_bad_count++] = i;
+            } else if (players[i].skill_level == SKILL_LOW_EXTREME && low_extreme_count < 10) {
+                low_extreme_indices[low_extreme_count++] = i;
+            } else if (players[i].skill_level == SKILL_NORMAL && normal_count_track < 10) {
+                normal_indices[normal_count_track++] = i;
+            }
+        }
+    }
