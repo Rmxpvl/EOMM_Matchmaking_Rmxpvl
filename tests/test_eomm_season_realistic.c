@@ -30,13 +30,11 @@
  * ============================================================ */
 
 typedef enum {
-    SKILL_NORMAL = 0,           /* baseline: 950-1050 MMR */
-    SKILL_SMURF_LOW = 1,        /* +200-300 MMR above normal */
-    SKILL_SMURF_MED = 2,        /* +400-600 MMR above normal */
-    SKILL_SMURF_HIGH = 3,       /* +700-1000 MMR above normal */
-    SKILL_LOW_BAD = 4,          /* 500-700 MMR */
-    SKILL_LOW_VERY_BAD = 5,     /* 300-500 MMR */
-    SKILL_LOW_EXTREME = 6       /* 100-300 MMR */
+    SKILL_LOW_EXTREME = 0,      /* 100-300 MMR: weakest players, extreme disadvantage */
+    SKILL_LOW_VERY_BAD = 1,     /* 350-750 MMR: low skill, merged LOW_BAD, distinct from NORMAL */
+    SKILL_NORMAL = 2,           /* 850-1030 MMR: baseline, represents ~50% WR equilibrium */
+    SKILL_SMURF_MED = 3,        /* 1150-1250 MMR: ~200-400 above NORMAL, clear smurf */
+    SKILL_SMURF_HIGH = 4        /* 1350-1550 MMR: ~520-700 above NORMAL, extreme smurf */
 } SkillLevel;
 
 typedef struct {
@@ -159,42 +157,73 @@ float get_target_mmr_for_skill_level(SkillLevel skill_level) {
        High-skill: target HIGH (they earn it with dominance)
        - SMURF_HIGH: Maintain ~90% WR → target = 1750 (stays at top)
        - SMURF_MED: Achieve ~70% WR → target = 1350
-       - SMURF_LOW: Achieve ~55% WR → target = 1100
        
-       Mid-skill: target baseline
-       - NORMAL: Expected ~50% WR → target = 1000
+       Mid-skill: target baseline (extended variance)
+       - NORMAL: Expected ~50% WR → target = 1000 (includes light smurfs)
        
        Low-skill: target LOW (blocked at their natural level)
-       - LOW_BAD: Natural ~45% WR → target = 910
-       - LOW_VERY_BAD: Natural ~43% WR → target = 890
+       - LOW_VERY_BAD: Natural ~43% WR → target = 890 (merged with LOW_BAD)
        - LOW_EXTREME: Natural ~37% WR → target = 800
     */
     switch (skill_level) {
         case SKILL_SMURF_HIGH:     return 1750.0f;  /* Stay dominant: 90% WR equilibrium */
         case SKILL_SMURF_MED:      return 1350.0f;  /* Clear advantage: 70% WR equilibrium */
-        case SKILL_SMURF_LOW:      return 1100.0f;  /* Slight edge: 55% WR equilibrium */
-        case SKILL_NORMAL:         return 1000.0f;  /* Balanced: 50% WR (baseline) */
-        case SKILL_LOW_BAD:        return 910.0f;   /* Slight disadvantage: 45% WR */
-        case SKILL_LOW_VERY_BAD:   return 890.0f;   /* Significant disadvantage: 43% WR */
+        case SKILL_NORMAL:         return 1000.0f;  /* Balanced: 50% WR (baseline, extended variance) */
+        case SKILL_LOW_VERY_BAD:   return 890.0f;   /* Disadvantage: 43% WR (merged LOW_BAD) */
         case SKILL_LOW_EXTREME:    return 800.0f;   /* Extreme disadvantage: 37% WR */
         default:                   return 1000.0f;
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* EARLY POOL STOMP BIAS: Boost smurf WR in the first 50 games of the season  */
+/* This ensures smurfs experience 60-70% WR in Pool 1 before equilibrium kicks */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Forward declarations for helper functions used in stomp bonus */
+int is_smurf(SkillLevel skill);
+int is_low_skill(SkillLevel skill);
+
+/* Apply stomp bias in first 50 games: favor team with more smurfs */
+float get_early_pool_stomp_bonus(PlayerTimeline *team_a[], PlayerTimeline *team_b[]) {
+    /* Check average games played across both teams */
+    float avg_games = 0.0f;
+    for (int i = 0; i < 5; i++) {
+        avg_games += (float)(team_a[i]->actual_game_count + team_b[i]->actual_game_count) / 10.0f;
+    }
+    
+    if (avg_games >= 50.0f) return 0.0f;  /* After pool 1, no bias */
+    
+    /* Count smurfs in each team */
+    int smurfs_a = 0, smurfs_b = 0;
+    
+    for (int i = 0; i < 5; i++) {
+        if (is_smurf(team_a[i]->skill_level)) smurfs_a++;
+        if (is_smurf(team_b[i]->skill_level)) smurfs_b++;
+    }
+    
+    /* Ramping factor: full at game 0, zero at game 50 */
+    float ramp = 1.0f - (avg_games / 50.0f);
+    
+    /* Bias strength: 15% per extra smurf, reduced by ramp */
+    float base_bias = 0.15f;
+    
+    if (smurfs_a > smurfs_b) {
+        return base_bias * (float)(smurfs_a - smurfs_b) * ramp;
+    } else if (smurfs_b > smurfs_a) {
+        return -base_bias * (float)(smurfs_b - smurfs_a) * ramp;
+    }
+    
+    return 0.0f;
+}
+
 void update_mmr(PlayerTimeline *p, float opponent_mmr, int did_win) {
     float expected = calculate_expected(p->mmr_raw, opponent_mmr);
     
-    /* CRITICAL FIX: Moderate clamp for low skill players to require ~55% WR to climb */
-    if (p->skill_level == SKILL_LOW_VERY_BAD || p->skill_level == SKILL_LOW_EXTREME || p->skill_level == SKILL_LOW_BAD) {
-        /* Moderate clamp: 0.30-0.85 instead of 0.10-0.90 */
-        /* This requires about 55% WR to break even */
-        if (expected > 0.85f) expected = 0.85f;
-        if (expected < 0.30f) expected = 0.30f;
-    } else {
-        /* Standard clamp for normal/smurf players */
-        if (expected > 0.90f) expected = 0.90f;
-        if (expected < 0.10f) expected = 0.10f;
-    }
+    /* MINIMAL clamp: only prevent numerical edge cases, NOT to shape behavior */
+    /* Aggressive clamping kills ELO's natural dynamics - use only as safety net */
+    if (expected > 0.98f) expected = 0.98f;
+    if (expected < 0.02f) expected = 0.02f;
     
     float outcome = did_win ? 1.0f : 0.0f;
     
@@ -202,32 +231,13 @@ void update_mmr(PlayerTimeline *p, float opponent_mmr, int did_win) {
     float K = get_dynamic_K(p->total_games);
     
     /* K reduction for very weak players */
-    if (p->skill_level == SKILL_LOW_VERY_BAD || p->skill_level == SKILL_LOW_EXTREME || p->skill_level == SKILL_LOW_BAD) {
+    if (p->skill_level == SKILL_LOW_VERY_BAD || p->skill_level == SKILL_LOW_EXTREME) {
         K *= 0.55f;
     }
     
     float delta = K * (outcome - expected);
     
-    /* ESSENTIAL FIX: Apply WR-based scaling to enforce ELO fundamental law */
-    /* Players with WR < 50% should not climb, WR > 50% should climb */
-    if (p->total_games >= 20) {  /* Only after minimum sample size */
-        float player_wr = (float)p->wins / (float)p->total_games;
-        
-        /* Factor ranges from -1.0 (0% WR) to +1.0 (100% WR) */
-        float wr_factor = (player_wr - 0.5f) * 2.0f;
-        
-        /* Clamp to prevent extreme scaling at edges */
-        /* This prevents 100% WR from getting 2x multiplier */
-        if (wr_factor > 0.5f) wr_factor = 0.5f;
-        if (wr_factor < -0.5f) wr_factor = -0.5f;
-        
-        /* Apply clamped scaling (coefficient 1.0) */
-        /* 40% WR: wr_factor = -0.2, delta *= 0.8 (20% reduction) */
-        /* 50% WR: wr_factor = 0, delta unchanged */
-        /* 65% WR: wr_factor = 0.3, delta *= 1.3 (30% boost) */
-        /* 100% WR (clamped to 0.5): delta *= 1.5 (50% boost, capped) */
-        delta *= (1.0f + wr_factor * 1.0f);
-    }
+    /* NO WR scaling for baseline test - check if carry saturation + expected clamping work alone */
     
     
     p->mmr_raw += delta;
@@ -257,12 +267,12 @@ void init_player(PlayerTimeline *p, int id, SkillLevel skill) {
     
     /* Performance stats based on skill level */
     float lo, hi;
-    if (skill == SKILL_SMURF_LOW || skill == SKILL_SMURF_MED || skill == SKILL_SMURF_HIGH) {
-        lo = 0.48f; hi = 0.68f;  /* High performer */
-    } else if (skill == SKILL_LOW_BAD || skill == SKILL_LOW_VERY_BAD || skill == SKILL_LOW_EXTREME) {
+    if (skill == SKILL_SMURF_MED || skill == SKILL_SMURF_HIGH) {
+        lo = 0.48f; hi = 0.68f;  /* High performer (pure smurfs) */
+    } else if (skill == SKILL_LOW_VERY_BAD || skill == SKILL_LOW_EXTREME) {
         lo = 0.34f; hi = 0.54f;  /* Low performer */
     } else {
-        lo = 0.30f; hi = 0.70f;  /* Normal range */
+        lo = 0.30f; hi = 0.70f;  /* Normal range (includes light smurfs) */
     }
     
     float range = hi - lo;
@@ -275,28 +285,25 @@ void init_player(PlayerTimeline *p, int id, SkillLevel skill) {
     p->perf.wave_management = lo + randf() * range;
     p->perf.teamfight_positioning = lo + randf() * range;
     
-    /* MMR INIT by skill level (realistic distribution) */
+    /* MMR INIT by skill level (realistic distribution - NO OVERLAP) */
     switch (skill) {
-        case SKILL_SMURF_LOW:
-            p->mmr_raw = 1200.0f + randf() * 100.0f;  /* +200-300 */
-            break;
-        case SKILL_SMURF_MED:
-            p->mmr_raw = 1400.0f + randf() * 200.0f;  /* +400-600 */
-            break;
-        case SKILL_SMURF_HIGH:
-            p->mmr_raw = 1700.0f + randf() * 300.0f;  /* +700-1000 */
-            break;
-        case SKILL_LOW_BAD:
-            p->mmr_raw = 500.0f + randf() * 200.0f;   /* 500-700 */
+        case SKILL_LOW_EXTREME:
+            p->mmr_raw = 100.0f + randf() * 200.0f;   /* 100-300: weakest, extreme disadvantage */
             break;
         case SKILL_LOW_VERY_BAD:
-            p->mmr_raw = 300.0f + randf() * 200.0f;   /* 300-500 */
+            p->mmr_raw = 350.0f + randf() * 400.0f;   /* 350-750: low skill, distinct gap before NORMAL */
             break;
-        case SKILL_LOW_EXTREME:
-            p->mmr_raw = 100.0f + randf() * 200.0f;   /* 100-300 */
+        case SKILL_NORMAL:
+            p->mmr_raw = 850.0f + randf() * 180.0f;   /* 850-1030: baseline equilibrium */
+            break;
+        case SKILL_SMURF_MED:
+            p->mmr_raw = 1150.0f + randf() * 100.0f;  /* 1150-1250: ~200-400 above NORMAL */
+            break;
+        case SKILL_SMURF_HIGH:
+            p->mmr_raw = 1350.0f + randf() * 200.0f;  /* 1350-1550: ~520-700 above NORMAL */
             break;
         default:
-            p->mmr_raw = 950.0f + randf() * 100.0f;   /* 950-1050: normal */
+            p->mmr_raw = 850.0f + randf() * 180.0f;   /* fallback: baseline */
             break;
     }
     
@@ -314,30 +321,22 @@ void init_player(PlayerTimeline *p, int id, SkillLevel skill) {
 }
 
 void init_players(PlayerTimeline *players, int n) {
-    /* Distribution: Smurfs 2.2%, Low Skill 10%, Normal 87.8% */
-    int n_smurfs_total = (int)(n * 0.022f);  /* ~22 for n=1000 */
+    /* Distribution: Heavy smurfs 3.2%, Low Skill 10%, Normal 86.8% */
+    int n_smurfs_total = (int)(n * 0.032f);  /* ~32 for n=1000 (merged removed SMURF_LOW) */
     int n_low_total = (int)(n * 0.100f);    /* ~100 for n=1000 */
     /* rest = normal */
     
-    /* Smurf sub-distribution: 50% LOW, 35% MED, 15% HIGH */
-    int n_smurf_low = (int)(n_smurfs_total * 0.50f);
-    int n_smurf_med = (int)(n_smurfs_total * 0.35f);
-    int n_smurf_high = n_smurfs_total - n_smurf_low - n_smurf_med;
+    /* Smurf sub-distribution (no LOW): 55% MED, 45% HIGH */
+    int n_smurf_med = (int)(n_smurfs_total * 0.55f);
+    int n_smurf_high = n_smurfs_total - n_smurf_med;
     
-    /* Low skill sub-distribution: 50% BAD, 35% VERY_BAD, 15% EXTREME */
-    int n_low_bad = (int)(n_low_total * 0.50f);
-    int n_low_very_bad = (int)(n_low_total * 0.35f);
-    int n_low_extreme = n_low_total - n_low_bad - n_low_very_bad;
+    /* Low skill sub-distribution (merged LOW_BAD + LOW_VERY_BAD): 50% VERY_BAD, 50% EXTREME */
+    int n_low_very_bad = (int)(n_low_total * 0.50f);
+    int n_low_extreme = n_low_total - n_low_very_bad;
     
     int idx = 0;
     
-    /* Initialize smurf low */
-    for (int i = 0; i < n_smurf_low; i++) {
-        init_player(&players[idx], idx, SKILL_SMURF_LOW);
-        idx++;
-    }
-    
-    /* Initialize smurf med */
+    /* Initialize smurf med (merged removed SMURF_LOW distribution) */
     for (int i = 0; i < n_smurf_med; i++) {
         init_player(&players[idx], idx, SKILL_SMURF_MED);
         idx++;
@@ -349,13 +348,7 @@ void init_players(PlayerTimeline *players, int n) {
         idx++;
     }
     
-    /* Initialize low bad */
-    for (int i = 0; i < n_low_bad; i++) {
-        init_player(&players[idx], idx, SKILL_LOW_BAD);
-        idx++;
-    }
-    
-    /* Initialize low very bad */
+    /* Initialize low very bad (merged with LOW_BAD) */
     for (int i = 0; i < n_low_very_bad; i++) {
         init_player(&players[idx], idx, SKILL_LOW_VERY_BAD);
         idx++;
@@ -456,22 +449,20 @@ const char* mmr_to_rank(float mmr) {
 
 /* Classification helpers for aggregating smurf/normal/low skill groups */
 int is_smurf(SkillLevel skill) {
-    return skill == SKILL_SMURF_LOW || skill == SKILL_SMURF_MED || skill == SKILL_SMURF_HIGH;
+    return skill == SKILL_SMURF_MED || skill == SKILL_SMURF_HIGH;
 }
 
 int is_low_skill(SkillLevel skill) {
-    return skill == SKILL_LOW_BAD || skill == SKILL_LOW_VERY_BAD || skill == SKILL_LOW_EXTREME;
+    return skill == SKILL_LOW_VERY_BAD || skill == SKILL_LOW_EXTREME;
 }
 
 const char* skill_label(SkillLevel skill) {
     switch (skill) {
-        case SKILL_SMURF_LOW: return "🔥 SMURF_LOW";
         case SKILL_SMURF_MED: return "🔥🔥 SMURF_MED";
         case SKILL_SMURF_HIGH: return "🔥🔥🔥 SMURF_HIGH";
-        case SKILL_LOW_BAD: return "💔 LOW_BAD";
-        case SKILL_LOW_VERY_BAD: return "💔💔 LOW_VERY_BAD";
+        case SKILL_LOW_VERY_BAD: return "💔💔 LOW_VERY_BAD (merged)";
         case SKILL_LOW_EXTREME: return "💔💔💔 LOW_EXTREME";
-        default: return "📊 NORMAL";
+        default: return "📊 NORMAL (expanded)";
     }
 }
 
@@ -745,38 +736,30 @@ int main(void) {
     printf("Simulating 100,000 games with 1000 players...\n");
     printf("(Each player tracked individually - 1000 games each)\n\n");
     
-    /* Find 7 tracked players: 1 of each skill type */
-    TrackedPlayer tracked[7] = {0};
+    /* Find 5 tracked players: 1 of each skill type (merged categories) */
+    TrackedPlayer tracked[5] = {0};
     int tracked_count = 0;
     
-    for (int i = 0; i < N_PLAYERS && tracked_count < 7; i++) {
-        if (players[i].skill_level == SKILL_SMURF_LOW && !tracked[0].player) {
+    for (int i = 0; i < N_PLAYERS && tracked_count < 5; i++) {
+        if (players[i].skill_level == SKILL_SMURF_MED && !tracked[0].player) {
             tracked[0].player = &players[i];
-            tracked[0].label = "🔥 SMURF_LOW";
+            tracked[0].label = "🔥🔥 SMURF_MED";
             tracked_count++;
-        } else if (players[i].skill_level == SKILL_SMURF_MED && !tracked[1].player) {
+        } else if (players[i].skill_level == SKILL_SMURF_HIGH && !tracked[1].player) {
             tracked[1].player = &players[i];
-            tracked[1].label = "🔥🔥 SMURF_MED";
+            tracked[1].label = "🔥🔥🔥 SMURF_HIGH";
             tracked_count++;
-        } else if (players[i].skill_level == SKILL_SMURF_HIGH && !tracked[2].player) {
+        } else if (players[i].skill_level == SKILL_NORMAL && !tracked[2].player) {
             tracked[2].player = &players[i];
-            tracked[2].label = "🔥🔥🔥 SMURF_HIGH";
+            tracked[2].label = "📊 NORMAL (expanded)";
             tracked_count++;
-        } else if (players[i].skill_level == SKILL_NORMAL && !tracked[3].player) {
+        } else if (players[i].skill_level == SKILL_LOW_VERY_BAD && !tracked[3].player) {
             tracked[3].player = &players[i];
-            tracked[3].label = "📊 NORMAL";
+            tracked[3].label = "💔💔 LOW_VERY_BAD (merged)";
             tracked_count++;
-        } else if (players[i].skill_level == SKILL_LOW_BAD && !tracked[4].player) {
+        } else if (players[i].skill_level == SKILL_LOW_EXTREME && !tracked[4].player) {
             tracked[4].player = &players[i];
-            tracked[4].label = "💔 LOW_BAD";
-            tracked_count++;
-        } else if (players[i].skill_level == SKILL_LOW_VERY_BAD && !tracked[5].player) {
-            tracked[5].player = &players[i];
-            tracked[5].label = "💔💔 LOW_VERY_BAD";
-            tracked_count++;
-        } else if (players[i].skill_level == SKILL_LOW_EXTREME && !tracked[6].player) {
-            tracked[6].player = &players[i];
-            tracked[6].label = "💔💔💔 LOW_EXTREME";
+            tracked[4].label = "💔💔💔 LOW_EXTREME";
             tracked_count++;
         }
     }
@@ -877,8 +860,16 @@ int main(void) {
             /* MMR gap for variance (using effective ratings) */
             float mmr_gap = fabsf(team_a_mmr_eff - team_b_mmr_eff);
             
-            /* Base win probability from ELO difference (using EFFECTIVE ratings) */
-            float win_prob_a = calculate_expected(team_a_mmr_eff, team_b_mmr_eff);
+            /* CRITICAL FIX: Base win probability from RAW ELO (not effective) */
+            /* Carry affects who plays, not ELO progression - must use raw for consistency */
+            float win_prob_a = calculate_expected(team_a_raw_avg, team_b_raw_avg);
+            
+            /* ═══════════════════════════════════════════════════════════════════════════ */
+            /* EARLY POOL STOMP BIAS: Apply stomp bonus for smurfs in first 50 games      */
+            /* This ensures smurfs experience 60-70% WR in Pool 1 before equilibrium kicks */
+            /* ═══════════════════════════════════════════════════════════════════════════ */
+            float stomp_bonus = get_early_pool_stomp_bonus(team_a, team_b);
+            win_prob_a += stomp_bonus;
             
             /* Asymmetric advantage from MMR gap */
             float strength_factor = fminf(mmr_gap / 2500.0f, 0.20f);
@@ -938,8 +929,8 @@ int main(void) {
                 if (a_won) { pa->wins++; pb->losses++; }
                 else       { pa->losses++; pb->wins++; }
                 
-                /* MMR update against TEAM AVERAGE (not carry-weighted) */
-                /* Carry weight affects win probability, not MMR gains */
+                /* MMR update AGAINST TEAM AVERAGE (raw MMR only for ELO consistency) */
+                /* Carry affects MATCHMAKING (win_prob), not ELO PROGRESSION */
                 update_mmr(pa, team_b_raw_avg, a_won);
                 update_mmr(pb, team_a_raw_avg, b_won);
                 
@@ -967,16 +958,16 @@ int main(void) {
     
     printf("\n✅ Simulation complete\n\n");
         /* ═════════════════════════════════════════════════════════════ */
-    /* ANALYSIS: 7 TRACKED PLAYERS WITH POOL STATS */
+    /* ANALYSIS: 5 TRACKED PLAYERS WITH POOL STATS */
     /* ═════════════════════════════════════════════════════════════ */
     
     printf("═════════════════════════════════════════════════════════════\n");
-    printf("📊 7 TRACKED PLAYERS - CUMULATIVE POOL ANALYSIS (ALL SKILL TYPES)\n");
+    printf("📊 5 TRACKED PLAYERS - CUMULATIVE POOL ANALYSIS (ALL SKILL TYPES)\n");
     printf("═════════════════════════════════════════════════════════════\n\n");
     
     /* Calculate pool stats for all 4 pools (50, 100, 200, 300) */
     int pool_sizes[] = {50, 100, 200, 300};
-    for (int t = 0; t < 7; t++) {
+    for (int t = 0; t < 5; t++) {
         TrackedPlayer *tp = &tracked[t];
         if (!tp->player) continue;
         
@@ -1017,37 +1008,31 @@ int main(void) {
     printf("👥 PLAYER-CENTRIC SEASON ANALYSIS (SAMPLES)\n");
     printf("═══════════════════════════════════════════════════════\n\n");
     
-    /* Find one of each skill type for detailed analysis */
-    PlayerTimeline *samples[7] = {NULL};
+    /* Find one of each skill type for detailed analysis (5 merged categories) */
+    PlayerTimeline *samples[5] = {NULL};
     for (int i = 0; i < N_PLAYERS; i++) {
-        if (players[i].skill_level == SKILL_SMURF_LOW && !samples[0]) {
+        if (players[i].skill_level == SKILL_SMURF_MED && !samples[0]) {
             samples[0] = &players[i];
-        } else if (players[i].skill_level == SKILL_SMURF_MED && !samples[1]) {
+        } else if (players[i].skill_level == SKILL_SMURF_HIGH && !samples[1]) {
             samples[1] = &players[i];
-        } else if (players[i].skill_level == SKILL_SMURF_HIGH && !samples[2]) {
+        } else if (players[i].skill_level == SKILL_NORMAL && !samples[2]) {
             samples[2] = &players[i];
-        } else if (players[i].skill_level == SKILL_NORMAL && !samples[3]) {
+        } else if (players[i].skill_level == SKILL_LOW_VERY_BAD && !samples[3]) {
             samples[3] = &players[i];
-        } else if (players[i].skill_level == SKILL_LOW_BAD && !samples[4]) {
+        } else if (players[i].skill_level == SKILL_LOW_EXTREME && !samples[4]) {
             samples[4] = &players[i];
-        } else if (players[i].skill_level == SKILL_LOW_VERY_BAD && !samples[5]) {
-            samples[5] = &players[i];
-        } else if (players[i].skill_level == SKILL_LOW_EXTREME && !samples[6]) {
-            samples[6] = &players[i];
         }
     }
     
     const char *sample_labels[] = {
-        "🔥 SMURF_LOW (High Skill)",
         "🔥🔥 SMURF_MED (High Skill)",
         "🔥🔥🔥 SMURF_HIGH (High Skill)",
-        "📊 NORMAL (Medium Skill)",
-        "💔 LOW_BAD (Low Skill)",
-        "💔💔 LOW_VERY_BAD (Low Skill)",
+        "📊 NORMAL (Medium Skill, expanded)",
+        "💔💔 LOW_VERY_BAD (Low Skill, merged)",
         "💔💔💔 LOW_EXTREME (Low Skill)"
     };
     
-    PlayerTimeline *smurf_sample = samples[0], *normal_sample = samples[3], *hardstuck_sample = samples[4];
+    PlayerTimeline *smurf_sample = samples[0], *normal_sample = samples[2], *hardstuck_sample = samples[3];
     
     #define ANALYZE_PLAYER(p, label) \
     do { \

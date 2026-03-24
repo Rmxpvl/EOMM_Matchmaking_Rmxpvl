@@ -140,6 +140,19 @@ typedef enum {
 } Rank;
 
 /*
+ * PlayerGroup — segmentation for differential EOMM treatment.
+ *
+ *   CORE        : 80% of players (SKILL_NORMAL, SKILL_HARDSTUCK normal)
+ *   OUTLIERS_HIGH : Smurfs (SKILL_SMURF) — progressive difficulty for convergence
+ *   OUTLIERS_LOW  : Hardstuck extreme cases — enhanced protection & compensation
+ */
+typedef enum {
+    GROUP_CORE          = 0,
+    GROUP_OUTLIERS_HIGH = 1,
+    GROUP_OUTLIERS_LOW  = 2
+} PlayerGroup;
+
+/*
  * HiddenState — player's current mental / behavioral category.
  * Derived each round from lose_streak and hidden_factor.
  *
@@ -327,6 +340,12 @@ void apply_soft_reset(Player *p);
 
 /* ELO calculation for expected win probability. */
 float calculate_expected(float mmr_a, float mmr_b);
+
+/* Determine player grouping for differential EOMM treatment. */
+PlayerGroup get_player_group(const Player *p);
+
+/* Calculate target MMR for convergence (group-dependent). */
+float get_target_mmr_for_group(const Player *p);
 
 /* Apply EOMM matchmaking bias (hidden_factor via opponent difficulty). */
 float apply_eomm_bias(Player *p, float opponent_mmr);

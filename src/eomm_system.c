@@ -29,16 +29,122 @@ static float clampf(float x, float lo, float hi) {
 }
 
 /*
+ * calculate_eomm_weight — compute global EOMM influence weight.
+ *
+ * Purpose: Scale all EOMM effects (bias, engagement, compensation) based
+ * on the calibration phase and total games played.
+ *
+ * Calibration phase (games 0-50): weight = 0 (EOMM disabled)
+ * Ramp-up phase (games 50-150): weight gradually increases to 1.0
+ * Stable phase (games 150+): weight = 1.0
+ *
+ * This ensures early skill expression while preventing over-correction.
+ */
+static inline float calculate_eomm_weight(int total_games) {
+    if (total_games < 50) {
+        return 0.0f;  /* Calibration: zero EOMM */
+    }
+    if (total_games <= 150) {
+        return (float)(total_games - 50) / 100.0f;  /* Ramp from 0 to 1 */
+    }
+    return 1.0f;  /* Full EOMM after 150 games */
+}
+
+/*
+ * get_player_group — categorize a player for differential EOMM treatment.
+ *
+ * CORE (GROUP_CORE): 80% baseline
+ *   - SKILL_NORMAL players
+ *   - SKILL_HARDSTUCK (normal low skill, not extreme)
+ *   → Standard EOMM, standard K-factor, standard compensation
+ *
+ * OUTLIERS_HIGH (GROUP_OUTLIERS_HIGH): Smurfs who dominate
+ *   - SKILL_SMURF
+ *   → Progressive difficulty: harder opponents as they climb
+ *   → Effect: Prevent roflstomp at low MMR, natural convergence
+ *
+ * OUTLIERS_LOW (GROUP_OUTLIERS_LOW): Hardstuck extreme / very low skill
+ *   - SKILL_HARDSTUCK with very low perf stats (avg < 0.25)
+ *   → Enhanced protection: 2x compensation bonus
+ *   → Softer matchmaking: reduced bias on losses
+ */
+PlayerGroup get_player_group(const Player *p) {
+    if (p->skill_level == SKILL_SMURF) {
+        return GROUP_OUTLIERS_HIGH;
+    }
+    
+    if (p->skill_level == SKILL_HARDSTUCK) {
+        /* Check if extreme low skill (very low performance average) */
+        float avg_perf = (p->perf.mechanical_skill
+                        + p->perf.decision_making
+                        + p->perf.map_awareness
+                        + p->perf.tilt_resistance
+                        + p->perf.champion_pool_depth
+                        + p->perf.champion_proficiency
+                        + p->perf.wave_management
+                        + p->perf.teamfight_positioning) / 8.0f;
+        
+        if (avg_perf < 0.25f) {
+            return GROUP_OUTLIERS_LOW;
+        }
+    }
+    
+    return GROUP_CORE;
+}
+
+/*
+ * get_target_mmr_for_group — return equilibrium MMR target for convergence.
+ *
+ * Smurfs should converge at higher MMR (their true skill);
+ * normal players at 1000; hardstuck at lower MMR.
+ *
+ * For OUTLIERS_HIGH: target-based progressive difficulty
+ *   - SMURF climbing to target gets progressively harder opposition
+ *   - Once at target, additional EOMM bias prevents roflstomp
+ */
+float get_target_mmr_for_group(const Player *p) {
+    PlayerGroup group = get_player_group(p);
+    
+    switch (group) {
+        case GROUP_OUTLIERS_HIGH:
+            /* Smurfs converge at high MMR (their natural skill level)
+               Higher visible_mmr → need stronger opposition for convergence */
+            if (p->visible_mmr < 1500.0f) {
+                return 1400.0f;  /* Target for SMURF_MED (70% expected WR) */
+            } else {
+                return 1600.0f;  /* Target for SMURF_HIGH (80%+ expected WR) */
+            }
+        
+        case GROUP_OUTLIERS_LOW:
+            /* Hardstuck extreme: protect at low MMR (800-900) */
+            return 850.0f;
+        
+        case GROUP_CORE:
+        default:
+            /* Normal players converge at baseline */
+            if (p->skill_level == SKILL_HARDSTUCK) {
+                return 900.0f;  /* Hardstuck: slightly below baseline */
+            }
+            return 1000.0f;     /* NORMAL: perfect balance */
+    }
+}
+
+/*
  * get_compensation_bonus — returns the win-probability bonus for a player
  * who has suffered COMPENSATION_THRESHOLD or more consecutive losses.
  *
+ * REFACTORED with GROUP consideration:
+ *   - GROUP_OUTLIERS_LOW: 2x multiplier (enhanced protection)
+ *   - GROUP_OUTLIERS_HIGH: full bonus (but they rarely get here)
+ *   - GROUP_CORE: standard bonus
+ *
  * Gradual escalation:
- *   7  losses → +15%
- *   8  losses → +25%
- *   9  losses → +35%
- *  10+ losses → +50% (capped at COMPENSATION_MAX_BONUS)
+ *   7  losses → +15% (or +30% for LOW outliers)
+ *   8  losses → +25% (or +50% for LOW outliers)
+ *   9  losses → +35% (or +70% for LOW outliers)
+ *  10+ losses → +50% (or +100% for LOW outliers)
  */
-static inline float get_compensation_bonus(int lose_streak) {
+static inline float get_compensation_bonus(int lose_streak, int total_games, const Player *p) {
     if (lose_streak < COMPENSATION_THRESHOLD) return 0.0f;
 
     float bonus;
@@ -51,6 +157,16 @@ static inline float get_compensation_bonus(int lose_streak) {
     } else {
         bonus = COMPENSATION_MAX_BONUS;
     }
+    
+    /* Apply global EOMM weight */
+    float weight = calculate_eomm_weight(total_games);
+    bonus = bonus * weight;
+    
+    /* GROUP consideration: double bonus for OUTLIERS_LOW */
+    if (get_player_group(p) == GROUP_OUTLIERS_LOW) {
+        bonus *= 2.0f;
+    }
+    
     return bonus;
 }
 
@@ -318,14 +434,24 @@ void update_tilt(Player *p, int did_win) {
         p->win_streak++;
         p->lose_streak = 0;
         
-        /* MODIFICATION 2: Increase win bonus 4x
-           OLD: +0.02
-           NEW: +0.08 (scale with streak length for super-linearity) */
         float bonus = FACTOR_WIN_BONUS;
         if (p->win_streak > 3) {
             bonus *= 1.5f;  /* 1.5x multiplier on streak */
         }
-        p->hidden_factor += bonus;
+        
+        /* REFACTOR: Apply hidden_factor smoothing (inertia) instead of direct update.
+           This prevents instant reactions and allows natural variance.
+           Smooth: new_hf = 0.9 * old_hf + 0.1 * (old_hf + bonus)
+        */
+        float target_factor = p->hidden_factor + bonus;
+        float weight = calculate_eomm_weight(p->total_games);
+        if (weight > 0.0f) {
+            /* After calibration: apply smoothing */
+            p->hidden_factor = 0.9f * p->hidden_factor + 0.1f * target_factor;
+        } else {
+            /* During calibration: no hidden_factor changes */
+            /* p->hidden_factor stays at 1.0 */
+        }
         
         /* Reduce tilt on win */
         if (p->tilt_level > 0) p->tilt_level--;
@@ -338,14 +464,21 @@ void update_tilt(Player *p, int did_win) {
         p->lose_streak++;
         p->win_streak = 0;
         
-        /* MODIFICATION 3: Increase loss penalty 4x
-           OLD: -0.05
-           NEW: -0.20 (scale with streak length for super-linearity) */
         float penalty = FACTOR_LOSS_PENALTY;
         if (p->lose_streak > 3) {
             penalty *= 1.5f;  /* 1.5x multiplier on streak */
         }
-        p->hidden_factor -= penalty;
+        
+        /* REFACTOR: Apply hidden_factor smoothing (inertia) instead of direct update */
+        float target_factor = p->hidden_factor - penalty;
+        float weight = calculate_eomm_weight(p->total_games);
+        if (weight > 0.0f) {
+            /* After calibration: apply smoothing */
+            p->hidden_factor = 0.9f * p->hidden_factor + 0.1f * target_factor;
+        } else {
+            /* During calibration: no hidden_factor changes */
+            /* p->hidden_factor stays at 1.0 */
+        }
         
         /* Increase tilt on loss */
         if (p->lose_streak >= 3) {
@@ -397,26 +530,32 @@ float calculate_expected(float mmr_a, float mmr_b) {
 /*
  * apply_eomm_bias — compute effective opponent MMR with EOMM adjustment.
  *
+ * REFACTORED for decoupling and calibration:
  * Purpose: Move hidden_factor influence from RATING (MMR) to MATCHMAKING.
  * The hidden_factor still affects engagement but via opponent difficulty,
  * not via inflating/deflating the player's own rating.
+ *
+ * Changes from original:
+ *   - Reduced bias magnitude: 50 MMR → 10 MMR (drastic reduction)
+ *   - Apply global EOMM weight (0.0-1.0 based on calibration phase)
+ *   - Zero bias during calibration (first 50 games)
  *
  * Logic:
  *   NEGATIVE state (tilted): bias is NEGATIVE → opponent appears WEAKER
  *   POSITIVE state (hot): bias is POSITIVE → opponent appears STRONGER
  *   NEUTRAL state: bias is neutral
- *
- * Magnitude: ±50 MMR × hidden_factor deviation from 1.0
  */
 float apply_eomm_bias(Player *p, float opponent_mmr) {
+    /* During calibration, return unmodified opponent MMR */
+    if (p->total_games < 50) {
+        return opponent_mmr;
+    }
+    
     /* Deviation from baseline (1.0) */
     float hf_deviation = p->hidden_factor - 1.0f;
     
-    /* Scale bias based on state:
-       Negative: help the player (reduce perceived opponent strength)
-       Positive: challenge the player (increase perceived opponent strength)
-    */
-    float bias_magnitude = 50.0f;  /* ±50 MMR range */
+    /* REDUCED bias magnitude: 10 MMR instead of 50 */
+    float bias_magnitude = 10.0f;  /* ±10 MMR range (was ±50) */
     float bias = 0.0f;
     
     if (p->hidden_state == STATE_NEGATIVE) {
@@ -424,6 +563,10 @@ float apply_eomm_bias(Player *p, float opponent_mmr) {
     } else if (p->hidden_state == STATE_POSITIVE) {
         bias = +bias_magnitude * hf_deviation;         /* positive bias → harder games */
     }
+    
+    /* Apply global EOMM weight (scales from 0 to 1 after calibration) */
+    float weight = calculate_eomm_weight(p->total_games);
+    bias *= weight;
     
     return opponent_mmr + bias;
 }
@@ -607,20 +750,37 @@ void update_engagement_phase(Player *p) {
  * apply_engagement_phase_modifiers — apply soft hidden_factor and
  * troll/autofill probability adjustments driven by the engagement phase.
  *
- * WIN_STREAK  : +5% hidden_factor (soft boost, favourable conditions)
- * LOSE_STREAK : -5% hidden_factor (soft nerf, adverse conditions)
+ * REFACTORED:
+ * WIN_STREAK  : +2% hidden_factor (reduced from ±5% for softer effect)
+ * LOSE_STREAK : -2% hidden_factor (reduced from ±5%)
+ *
+ * These modifiers are scaled down and further reduced via global EOMM weight.
+ * During calibration phase, engagement effects are disabled.
  *
  * Troll and autofill probabilities are modulated inside the EOMM
  * matchmaker via calculate_matchmaking_bias(); this function only
  * touches the hidden_factor.
  */
 void apply_engagement_phase_modifiers(Player *p) {
+    /* During calibration phase, don't apply engagement modifiers */
+    if (p->total_games < 50) {
+        return;
+    }
+    
+    /* Apply global EOMM weight to scale engagement effects */
+    float weight = calculate_eomm_weight(p->total_games);
+    if (weight <= 0.0f) return;  /* Skip if weight is zero */
+    
     if (p->engagement_phase == PHASE_WIN_STREAK) {
-        p->hidden_factor *= 1.05f;
+        /* Reduced effect: 1.02 instead of 1.05, further scaled by weight */
+        float factor = 1.0f + (0.02f * weight);  /* 2% base, scaled by weight */
+        p->hidden_factor *= factor;
         p->hidden_factor  = clampf(p->hidden_factor,
                                    HIDDEN_FACTOR_MIN, HIDDEN_FACTOR_MAX);
     } else if (p->engagement_phase == PHASE_LOSE_STREAK) {
-        p->hidden_factor *= 0.95f;
+        /* Reduced effect: 0.98 instead of 0.95, further scaled by weight */
+        float factor = 1.0f - (0.02f * weight);  /* 2% base, scaled by weight */
+        p->hidden_factor *= factor;
         p->hidden_factor  = clampf(p->hidden_factor,
                                    HIDDEN_FACTOR_MIN, HIDDEN_FACTOR_MAX);
     }
@@ -745,10 +905,10 @@ int simulate_match(Match *m) {
     float win_prob_a = (total > 0.0f) ? (power_a / total) : 0.5f;
     /* → win_prob_a maintains single metric space */
 
-    /* STEP 2: Apply compensation bonus (unchanged) */
+    /* STEP 2: Apply compensation bonus (with EOMM weight scaling) */
     float max_bonus = 0.0f;
     for (int i = 0; i < TEAM_SIZE; i++) {
-        float bonus = get_compensation_bonus(m->team_a[i]->lose_streak);
+        float bonus = get_compensation_bonus(m->team_a[i]->lose_streak, m->team_a[i]->total_games, m->team_a[i]);
         if (bonus > max_bonus) max_bonus = bonus;
     }
     if (max_bonus > 0.0f) {
@@ -1034,95 +1194,24 @@ static void create_matches_eomm(Player *players, int n,
 
         int a_count = 0, b_count = 0;
 
-        /* ✅ PHASE 0: SKILL-AWARE TEAM COMPOSITION (100% Separation) */
-        /* Strategy: Aggressive Smurfs→team_b and Hardstuck→team_a + random Normals */
-        
-        /* 0a. Extract skill tiers */
-        Player **smurfs = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
-        Player **hardstuck_pool = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
-        Player **normals = (Player **)malloc(sizeof(Player *) * (healthy_n + tilt_n));
-        int smurf_n = 0, hardstuck_n = 0, normal_n = 0;
+        /* 🚀 SIMPLIFIED MATCHMAKING (PHASE 0 REMOVED)
+         * 
+         * Instead of skill-aware team composition, use:
+         *   1. Tilt-based assignment (negative → team_a)
+         *   2. Engagement phase bias (from any_pool)
+         *   3. MMR balance as fallback
+         *
+         * This allows natural skill expression early, while EOMM weight
+         * (0 until game 50) ensures no artificial suppression.
+         */
 
-        for (int h = 0; h < healthy_n; h++) {
-            Player *p = healthy_pool[h];
-            if (p->skill_level == SKILL_SMURF) smurfs[smurf_n++] = p;
-            else if (p->skill_level == SKILL_HARDSTUCK) hardstuck_pool[hardstuck_n++] = p;
-            else normals[normal_n++] = p;
-        }
-        for (int t = 0; t < tilt_n; t++) {
-            Player *p = tilt_pool[t];
-            if (p->skill_level == SKILL_SMURF) smurfs[smurf_n++] = p;
-            else if (p->skill_level == SKILL_HARDSTUCK) hardstuck_pool[hardstuck_n++] = p;
-            else normals[normal_n++] = p;
-        }
-        
-        shuffle_ptrs(smurfs, smurf_n);
-        shuffle_ptrs(hardstuck_pool, hardstuck_n);
-        shuffle_ptrs(normals, normal_n);
-        shuffle_ptrs(smurfs, smurf_n);
-        
-        /* 0b. Assign ~30% Hardstuck → team_a (weak preference, mostly random) */
-        int hardstuck_a_target = (int)(hardstuck_n * 0.30f);  /* ~30% of hardstuck */
-        for (int i = 0; i < hardstuck_a_target && i < hardstuck_n && a_count < TEAM_SIZE; i++) {
-            match->team_a[a_count++] = hardstuck_pool[i];
-            assigned[hardstuck_pool[i] - players] = 1;
-        }
-        
-        /* 0c. Assign ~30% Smurfs → team_b (weak preference, mostly random) */
-        int smurf_b_target = (int)(smurf_n * 0.30f);  /* ~30% of smurfs */
-        for (int i = 0; i < smurf_b_target && i < smurf_n && b_count < TEAM_SIZE; i++) {
-            match->team_b[b_count++] = smurfs[i];
-            assigned[smurfs[i] - players] = 1;
-        }
-        
-        /* 0d. Add remaining hardstuck/smurfs randomly (30% escape) */
-        for (int i = hardstuck_a_target; i < hardstuck_n; i++) {
-            if (b_count < TEAM_SIZE && !assigned[hardstuck_pool[i] - players]) {
-                match->team_b[b_count++] = hardstuck_pool[i];
-                assigned[hardstuck_pool[i] - players] = 1;
-            }
-        }
-        for (int i = smurf_b_target; i < smurf_n; i++) {
-            if (a_count < TEAM_SIZE && !assigned[smurfs[i] - players]) {
-                match->team_a[a_count++] = smurfs[i];
-                assigned[smurfs[i] - players] = 1;
-            }
-        }
-        
-        /* 0e. Distribute Normals randomly to balance */
-        for (int i = 0; i < normal_n; i++) {
-            if (a_count <= b_count && a_count < TEAM_SIZE) {
-                match->team_a[a_count++] = normals[i];
-                assigned[normals[i] - players] = 1;
-            } else if (b_count < TEAM_SIZE) {
-                match->team_b[b_count++] = normals[i];
-                assigned[normals[i] - players] = 1;
-            } else if (a_count < TEAM_SIZE) {
-                match->team_a[a_count++] = normals[i];
-                assigned[normals[i] - players] = 1;
-            }
-        }
-        
-        free(smurfs); free(hardstuck_pool); free(normals);
-
-        /* --- Fill team_a (losing side) with tilt players (max TEAM_SIZE) --- */
+        /* --- Fill team_a with tilt players (max TEAM_SIZE) --- */
         for (int t = 0; t < tilt_n && a_count < TEAM_SIZE; t++) {
-            /* Hardstuck players are preferred for the losing slot */
-            if (tilt_pool[t]->skill_level == SKILL_HARDSTUCK ||
-                tilt_pool[t]->skill_level == SKILL_NORMAL) {
-                match->team_a[a_count++] = tilt_pool[t];
-                assigned[tilt_pool[t] - players] = 1;
-            }
-        }
-        /* Fill remaining team_a slots from tilt pool (any type) */
-        for (int t = 0; t < tilt_n && a_count < TEAM_SIZE; t++) {
-            if (!assigned[tilt_pool[t] - players]) {
-                match->team_a[a_count++] = tilt_pool[t];
-                assigned[tilt_pool[t] - players] = 1;
-            }
+            match->team_a[a_count++] = tilt_pool[t];
+            assigned[tilt_pool[t] - players] = 1;
         }
 
-        /* --- Fill team_b (winning side) with healthy players (max TEAM_SIZE) --- */
+        /* --- Fill team_b with healthy players (max TEAM_SIZE) --- */
         for (int h = 0; h < healthy_n && b_count < TEAM_SIZE; h++) {
             match->team_b[b_count++] = healthy_pool[h];
             assigned[healthy_pool[h] - players] = 1;
@@ -1216,8 +1305,16 @@ static void create_matches_eomm(Player *players, int n,
 void create_matches(Player *players, int n, Match *matches,
                     int *num_matches, int game_number) {
     if (game_number == 0) {
+        /* Game 0: fully random */
+        create_matches_random(players, n, matches, num_matches);
+    } else if (game_number < 50) {
+        /* CALIBRATION PHASE (games 1-49): pure random/MMR-based
+         * (no tilt-state manipulation, no engagement phase steering)
+         * Use random matchmaking to allow natural skill expression
+         */
         create_matches_random(players, n, matches, num_matches);
     } else {
+        /* POST-CALIBRATION (game 50+): full EOMM with weight ramping */
         create_matches_eomm(players, n, matches, num_matches);
     }
 }
